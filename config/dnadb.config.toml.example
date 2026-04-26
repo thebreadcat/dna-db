@@ -1,0 +1,29 @@
+# DNA-DB runtime configuration baseline (Stage 8).
+
+[server]
+host = "0.0.0.0"
+port = 4737
+http_port = 8080
+https_port = 8443
+
+[monitoring]
+enabled = true
+metrics_bind = "0.0.0.0:9464"
+health_endpoint = "/healthz"
+metrics_endpoint = "/metrics"
+
+[logging]
+format = "json"
+level = "info"
+
+[lifecycle]
+default_mode = "immortal"
+telomere_tracking = true
+auto_archive_enabled = false
+auto_delete_enabled = false
+
+[wire]
+mongo_enabled = true
+mongo_port = 27017
+postgres_enabled = true
+postgres_port = 5432

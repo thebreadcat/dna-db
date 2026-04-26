@@ -1,0 +1,8 @@
+FROM rust:1.86
+
+WORKDIR /app
+COPY . .
+
+RUN cd engine && cargo build --release --bin load_bench
+
+CMD ["./engine/target/release/load_bench", "--records", "100000", "--read-sample", "10000", "--data-dir", "/tmp/dnadb-bench-data"]

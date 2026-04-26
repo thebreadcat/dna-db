@@ -1,0 +1,42 @@
+# macOS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Logs / runtime outputs
+*.log
+logs/
+tmp/
+data/
+bench-output/
+bench-data*/
+engine/bench-data*/
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Rust
+target/
+**/target/
+
+# Node / TypeScript
+node_modules/
+**/node_modules/
+dist/
+coverage/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Packaging artifacts
+build/
+*.egg-info/
