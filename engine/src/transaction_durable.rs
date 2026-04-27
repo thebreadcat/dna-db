@@ -1,6 +1,6 @@
 //! Durable transaction runtime: MVCC transaction manager + WAL/materialization integration.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,9 @@ pub struct DurableTransactionStore {
     storage: CollectionStorage,
     codec: BincodeStrandCodec,
     collection_id: u32,
+    sort_index_fields: HashSet<String>,
+    sort_indexes: HashMap<String, BTreeSet<SortIndexEntry>>,
+    sort_index_values: HashMap<String, HashMap<u64, i64>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,9 +65,18 @@ pub enum ExecutionResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotQueryPlan {
     Direct,
+    SortIndex,
     Index,
     GuidedScan,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SortIndexEntry {
+    key: i64,
+    record_id: u64,
+}
+
+const DEFAULT_SORT_INDEX_FIELDS: [&str; 3] = ["updated_at", "created_at", "published_at"];
 
 #[derive(Debug, Default)]
 struct SnapshotIndexes {
@@ -87,9 +99,35 @@ impl DurableTransactionStore {
             storage: CollectionStorage::open_or_create(root, collection, initial_mmap)?,
             codec: BincodeStrandCodec,
             collection_id,
+            sort_index_fields: DEFAULT_SORT_INDEX_FIELDS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            sort_indexes: HashMap::new(),
+            sort_index_values: HashMap::new(),
         };
         out.replay_wal_to_mvcc()?;
+        out.rebuild_sort_indexes();
         Ok(out)
+    }
+
+    pub fn configure_sort_indexes(&mut self, fields: &[String]) {
+        self.sort_index_fields = fields.iter().cloned().collect();
+        self.rebuild_sort_indexes();
+    }
+
+    pub fn add_sort_index(&mut self, field: &str) {
+        if field.trim().is_empty() {
+            return;
+        }
+        self.sort_index_fields.insert(field.to_string());
+        self.rebuild_sort_indexes();
+    }
+
+    pub fn sort_index_fields(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.sort_index_fields.iter().cloned().collect();
+        out.sort();
+        out
     }
 
     pub fn begin(&mut self) -> Transaction {
@@ -115,6 +153,22 @@ impl DurableTransactionStore {
         txn: &Transaction,
         ast: &QueryAst,
     ) -> (Vec<crate::mvcc::Record>, SnapshotQueryPlan) {
+        // Hot-path optimization: `id = ...` lookups can read directly from MVCC
+        // without materializing a full visible snapshot or per-query indexes.
+        if let Some(id) = direct_lookup_id(ast) {
+            let rows = self
+                .tx_manager
+                .read(txn, id)
+                .filter(|r| matches_record(r, ast))
+                .into_iter()
+                .collect();
+            return (rows, SnapshotQueryPlan::Direct);
+        }
+
+        if let Some(rows) = self.sort_index_query_rows(txn, ast) {
+            return (rows, SnapshotQueryPlan::SortIndex);
+        }
+
         let visible: Vec<(u64, crate::mvcc::Record)> = self.tx_manager.visible_records(txn);
         let indexes = build_snapshot_indexes(&visible);
         let Some(guide) = compile_query(ast, None).ok() else {
@@ -134,6 +188,7 @@ impl DurableTransactionStore {
         };
         let mut rows = match plan {
             SnapshotQueryPlan::Direct => direct_query_rows(ast, &indexes),
+            SnapshotQueryPlan::SortIndex => vec![],
             SnapshotQueryPlan::Index => indexed_query_rows(ast, &indexes),
             SnapshotQueryPlan::GuidedScan => indexes
                 .all_records_by_id
@@ -164,6 +219,7 @@ impl DurableTransactionStore {
         self.tx_manager
             .can_commit(txn)
             .map_err(DurableTxnError::Transaction)?;
+        let pending_writes = txn.write_set.clone();
 
         for op in &txn.write_set {
             let payload = durable_payload_from_write_op(txn.txn_id, op)?;
@@ -181,9 +237,12 @@ impl DurableTransactionStore {
         self.storage.flush()?;
         self.wal.sync()?;
 
-        self.tx_manager
+        let commit_ts = self
+            .tx_manager
             .commit(txn)
-            .map_err(DurableTxnError::Transaction)
+            .map_err(DurableTxnError::Transaction)?;
+        self.apply_sort_index_writes(&pending_writes);
+        Ok(commit_ts)
     }
 
     /// Run MVCC version cleanup using active-snapshot safety.
@@ -271,6 +330,133 @@ impl DurableTransactionStore {
                 Ok(ExecutionResult::AffectedRows(ids.len()))
             }
         }
+    }
+
+    pub fn execute_insert_many(
+        &mut self,
+        records: Vec<Value>,
+    ) -> Result<ExecutionResult, DurableTxnError> {
+        if records.is_empty() {
+            return Ok(ExecutionResult::AffectedRows(0));
+        }
+        let affected = records.len();
+        let mut tx = self.begin();
+        for record in records {
+            let row = json_object_to_record(record)?;
+            let id = record_id_from_record(&row).ok_or(DurableTxnError::Transaction(
+                "record must contain numeric `id` field",
+            ))?;
+            self.upsert(&mut tx, id, row);
+        }
+        self.commit(&mut tx)?;
+        Ok(ExecutionResult::AffectedRows(affected))
+    }
+
+    fn rebuild_sort_indexes(&mut self) {
+        self.sort_indexes.clear();
+        self.sort_index_values.clear();
+        let tx = self.begin();
+        for (record_id, record) in self.tx_manager.visible_records(&tx) {
+            self.index_record_values(record_id, &record);
+        }
+    }
+
+    fn apply_sort_index_writes(&mut self, writes: &[WriteOp]) {
+        for op in writes {
+            match op {
+                WriteOp::Upsert { record_id, record } => {
+                    self.deindex_record(*record_id);
+                    self.index_record_values(*record_id, record);
+                }
+                WriteOp::Delete { record_id } => {
+                    self.deindex_record(*record_id);
+                }
+            }
+        }
+    }
+
+    fn deindex_record(&mut self, record_id: u64) {
+        let fields: Vec<String> = self.sort_index_fields.iter().cloned().collect();
+        for field in fields {
+            if let Some(prev_val) = self
+                .sort_index_values
+                .get_mut(field.as_str())
+                .and_then(|m| m.remove(&record_id))
+            {
+                if let Some(entries) = self.sort_indexes.get_mut(field.as_str()) {
+                    entries.remove(&SortIndexEntry {
+                        key: prev_val,
+                        record_id,
+                    });
+                }
+            }
+        }
+    }
+
+    fn index_record_values(&mut self, record_id: u64, record: &crate::mvcc::Record) {
+        let fields: Vec<String> = self.sort_index_fields.iter().cloned().collect();
+        for field in fields {
+            let Some(key) = record.get(field.as_str()).and_then(value_to_sort_key) else {
+                continue;
+            };
+            self.sort_indexes
+                .entry(field.clone())
+                .or_default()
+                .insert(SortIndexEntry { key, record_id });
+            self.sort_index_values
+                .entry(field)
+                .or_default()
+                .insert(record_id, key);
+        }
+    }
+
+    fn sort_index_query_rows(
+        &self,
+        txn: &Transaction,
+        ast: &QueryAst,
+    ) -> Option<Vec<crate::mvcc::Record>> {
+        let order = ast.order_by.as_ref()?;
+        let limit = ast.limit.map(|v| v as usize)?;
+        if limit == 0 || ast.includes.len() > 0 {
+            return None;
+        }
+        let entries = self.sort_indexes.get(&order.field)?;
+        let mut out = Vec::with_capacity(limit);
+        let iter = entries.iter();
+        match order.direction {
+            SortDirection::Asc => {
+                for entry in iter {
+                    if let Some(row) = self.tx_manager.read(txn, entry.record_id) {
+                        if matches_record(&row, ast) {
+                            out.push(row);
+                            if out.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            SortDirection::Desc => {
+                for entry in iter.rev() {
+                    if let Some(row) = self.tx_manager.read(txn, entry.record_id) {
+                        if matches_record(&row, ast) {
+                            out.push(row);
+                            if out.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+}
+
+fn value_to_sort_key(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_u64().and_then(|v| i64::try_from(v).ok())),
+        _ => None,
     }
 }
 

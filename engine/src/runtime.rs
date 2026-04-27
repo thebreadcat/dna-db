@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::transaction_durable::{DurableTransactionStore, DurableTxnError, ExecutionResult};
@@ -57,6 +58,40 @@ impl EngineRuntime {
         let collection = collection_name_for_operation(&op);
         let store = self.ensure_store(&collection)?;
         Ok(store.execute_wire_operation(op)?)
+    }
+
+    pub fn execute_mongo_insert_many(
+        &mut self,
+        collection: &str,
+        records: Vec<Value>,
+    ) -> Result<ExecutionResult, RuntimeError> {
+        let store = self.ensure_store(collection)?;
+        Ok(store.execute_insert_many(records)?)
+    }
+
+    pub fn configure_sort_indexes(
+        &mut self,
+        collection: &str,
+        fields: &[String],
+    ) -> Result<Vec<String>, RuntimeError> {
+        let store = self.ensure_store(collection)?;
+        store.configure_sort_indexes(fields);
+        Ok(store.sort_index_fields())
+    }
+
+    pub fn add_sort_index(
+        &mut self,
+        collection: &str,
+        field: &str,
+    ) -> Result<Vec<String>, RuntimeError> {
+        let store = self.ensure_store(collection)?;
+        store.add_sort_index(field);
+        Ok(store.sort_index_fields())
+    }
+
+    pub fn sort_index_fields(&mut self, collection: &str) -> Result<Vec<String>, RuntimeError> {
+        let store = self.ensure_store(collection)?;
+        Ok(store.sort_index_fields())
     }
 
     fn ensure_store(

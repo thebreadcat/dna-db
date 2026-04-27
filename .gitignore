@@ -8,6 +8,7 @@
 logs/
 tmp/
 data/
+cms/
 bench-output/
 # Track bench-data/README.md; ignore bulk datasets in that folder
 /bench-data/*
