@@ -115,6 +115,16 @@ DNA-DB is not a universal replacement for traditional databases.
 
 ---
 
+## `LIMIT` without `ORDER BY` (implicit ordering)
+
+In the **durable MVCC runtime** (used by the experimental `dnadb_http` server and similar paths), a query with **`limit`** but **no** explicit **`order_by`** is **not** “return any N matching rows in arbitrary order.” The engine applies a **default descending sort** on a configured field (typically `created_at`, else `updated_at`, else another configured sort index) so top‑`N` reads stay deterministic and planner-friendly.
+
+**Recommendation:** always pass an explicit sort in application code when order is part of your API contract. Rely on the default only when “newest (or configured default) first” is what you mean. Single-clause `slug` / `title` / `email` equality is exempt so exact-index paths stay fast.
+
+Details: [docs/QUERY_SEMANTICS.md](docs/QUERY_SEMANTICS.md).
+
+---
+
 ## How It Works (Simplified)
 
 DNA-DB uses a layered model:

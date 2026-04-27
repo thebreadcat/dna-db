@@ -111,7 +111,9 @@ pub enum ProcessorError {
 pub enum PersistMode {
     /// Flush mmap + sync files for every processed WAL entry.
     SyncEveryWrite,
-    /// Flush mmap only; durability sync is handled externally (group commit).
+    /// No flush inside [`process_wal_entry_with_mode`]; caller runs
+    /// [`CollectionStorage::flush`] / [`CollectionStorage::flush_maps`] after a batch
+    /// (e.g. one commit). WAL `sync` remains the caller's durability policy.
     Buffered,
 }
 
@@ -134,6 +136,10 @@ pub fn process_wal_entry(
 }
 
 /// Same as [`process_wal_entry`] but allows durability policy control.
+///
+/// [`PersistMode::Buffered`] does not call [`CollectionStorage::flush_maps`]; avoid
+/// thousands of full-map `msync`s per batch — the caller must flush after the WAL
+/// entries for that batch are processed (see `DurableTransactionStore::commit_inner`).
 pub fn process_wal_entry_with_mode(
     storage: &mut CollectionStorage,
     codec: &BincodeStrandCodec,
@@ -152,7 +158,7 @@ pub fn process_wal_entry_with_mode(
 
     match mode {
         PersistMode::SyncEveryWrite => storage.flush()?,
-        PersistMode::Buffered => storage.flush_maps()?,
+        PersistMode::Buffered => {}
     }
     storage.record_materialized_sequence(sequence);
     Ok(())

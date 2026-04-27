@@ -69,13 +69,29 @@ impl EngineRuntime {
         Ok(store.execute_insert_many(records)?)
     }
 
+    pub fn execute_mongo_insert_many_with_mode(
+        &mut self,
+        collection: &str,
+        records: Vec<Value>,
+        rebuild_indexes: bool,
+    ) -> Result<ExecutionResult, RuntimeError> {
+        let store = self.ensure_store(collection)?;
+        Ok(store.execute_insert_many_with_mode(records, rebuild_indexes)?)
+    }
+
+    pub fn rebuild_indexes(&mut self, collection: &str) -> Result<(), RuntimeError> {
+        let store = self.ensure_store(collection)?;
+        store.rebuild_indexes();
+        Ok(())
+    }
+
     pub fn configure_sort_indexes(
         &mut self,
         collection: &str,
         fields: &[String],
     ) -> Result<Vec<String>, RuntimeError> {
         let store = self.ensure_store(collection)?;
-        store.configure_sort_indexes(fields);
+        store.configure_sort_indexes(fields)?;
         Ok(store.sort_index_fields())
     }
 
@@ -85,13 +101,62 @@ impl EngineRuntime {
         field: &str,
     ) -> Result<Vec<String>, RuntimeError> {
         let store = self.ensure_store(collection)?;
-        store.add_sort_index(field);
+        store.add_sort_index(field)?;
         Ok(store.sort_index_fields())
     }
 
     pub fn sort_index_fields(&mut self, collection: &str) -> Result<Vec<String>, RuntimeError> {
         let store = self.ensure_store(collection)?;
         Ok(store.sort_index_fields())
+    }
+
+    pub fn sort_index_status(
+        &mut self,
+        collection: &str,
+    ) -> Result<(Vec<String>, Vec<(String, String)>, Vec<String>, &'static str), RuntimeError> {
+        let store = self.ensure_store(collection)?;
+        let (fields, state) = store.sort_index_status();
+        let exact = store.exact_string_index_fields();
+        Ok((fields, store.composite_sort_index_defs(), exact, state))
+    }
+
+    pub fn configure_exact_string_index_fields(
+        &mut self,
+        collection: &str,
+        fields: &[String],
+    ) -> Result<Vec<String>, RuntimeError> {
+        let store = self.ensure_store(collection)?;
+        store.configure_exact_string_index_fields(fields)?;
+        Ok(store.exact_string_index_fields())
+    }
+
+    pub fn exact_string_index_fields(
+        &mut self,
+        collection: &str,
+    ) -> Result<Vec<String>, RuntimeError> {
+        let store = self.ensure_store(collection)?;
+        Ok(store.exact_string_index_fields())
+    }
+
+    pub fn configure_composite_sort_indexes(
+        &mut self,
+        collection: &str,
+        defs: &[(String, String)],
+    ) -> Result<Vec<(String, String)>, RuntimeError> {
+        let store = self.ensure_store(collection)?;
+        store.configure_composite_sort_indexes(defs)?;
+        Ok(store.composite_sort_index_defs())
+    }
+
+    pub fn add_composite_sort_index(
+        &mut self,
+        collection: &str,
+        filter_field: &str,
+        order_field: &str,
+    ) -> Result<Vec<(String, String)>, RuntimeError> {
+        let store = self.ensure_store(collection)?;
+        store.add_composite_sort_index(filter_field, order_field)?;
+        Ok(store.composite_sort_index_defs())
     }
 
     fn ensure_store(

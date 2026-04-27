@@ -61,12 +61,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(get_sort_indexes).post(configure_sort_indexes),
         )
         .route(
+            "/collections/:collection/composite-sort-indexes",
+            post(configure_composite_sort_indexes),
+        )
+        .route(
+            "/collections/:collection/indexes",
+            get(get_index_status),
+        )
+        .route(
             "/collections/:collection/sort-indexes/add",
             post(add_sort_index),
         )
         .route(
             "/collections/:collection/documents/bulk",
             post(bulk_insert),
+        )
+        .route(
+            "/collections/:collection/indexes/rebuild",
+            post(rebuild_indexes),
         )
         .route(
             "/collections/:collection/documents",
@@ -133,6 +145,8 @@ async fn insert_one(
 #[derive(serde::Deserialize)]
 struct BulkBody {
     documents: Vec<Value>,
+    #[serde(default)]
+    defer_reindex: bool,
 }
 
 async fn bulk_insert(
@@ -140,17 +154,21 @@ async fn bulk_insert(
     AxumPath(collection): AxumPath<String>,
     Json(body): Json<BulkBody>,
 ) -> Result<Json<Value>, ApiError> {
-    const MAX_BATCH: usize = 2_000;
-    if body.documents.len() > MAX_BATCH {
+    let max_batch = std::env::var("DNADB_HTTP_MAX_BULK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(10_000);
+    if body.documents.len() > max_batch {
         return Err(ApiError::bad_request(format!(
-            "batch too large (max {MAX_BATCH})"
+            "batch too large (max {max_batch})"
         )));
     }
     let batch_size = body.documents.len();
     let t0 = Instant::now();
     let mut rt = state.rt.lock().await;
     let affected = match rt
-        .execute_mongo_insert_many(&collection, body.documents)
+        .execute_mongo_insert_many_with_mode(&collection, body.documents, !body.defer_reindex)
         .map_err(ApiError::runtime)?
     {
         ExecutionResult::AffectedRows(n) => n,
@@ -158,8 +176,25 @@ async fn bulk_insert(
     };
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     Ok(Json(
-        json!({ "ok": true, "affected": affected, "ms": ms, "batch_size": batch_size }),
+        json!({
+            "ok": true,
+            "affected": affected,
+            "ms": ms,
+            "batch_size": batch_size,
+            "defer_reindex": body.defer_reindex
+        }),
     ))
+}
+
+async fn rebuild_indexes(
+    State(state): State<AppState>,
+    AxumPath(collection): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let t0 = Instant::now();
+    let mut rt = state.rt.lock().await;
+    rt.rebuild_indexes(&collection).map_err(ApiError::runtime)?;
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    Ok(Json(json!({ "ok": true, "collection": collection, "ms": ms })))
 }
 
 #[derive(serde::Deserialize)]
@@ -206,6 +241,12 @@ async fn query_find(
 struct SortIndexConfigBody {
     #[serde(default)]
     sort_indexes: Vec<SortIndexSpec>,
+    #[serde(default)]
+    composite_sort_indexes: Vec<CompositeSortIndexSpec>,
+    /// If set (including empty `[]`), replaces exact-string index fields for this collection.
+    /// If omitted, exact-string fields are left unchanged.
+    #[serde(default)]
+    exact_string_fields: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -220,6 +261,11 @@ struct AddSortIndexBody {
     field: String,
 }
 
+#[derive(serde::Deserialize)]
+struct CompositeSortIndexSpec {
+    fields: Vec<String>,
+}
+
 async fn get_sort_indexes(
     State(state): State<AppState>,
     AxumPath(collection): AxumPath<String>,
@@ -228,7 +274,42 @@ async fn get_sort_indexes(
     let fields = rt
         .sort_index_fields(&collection)
         .map_err(ApiError::runtime)?;
-    Ok(Json(json!({ "ok": true, "collection": collection, "sort_indexes": fields })))
+    let exact = rt
+        .exact_string_index_fields(&collection)
+        .map_err(ApiError::runtime)?;
+    Ok(Json(
+        json!({ "ok": true, "collection": collection, "sort_indexes": fields, "exact_string_fields": exact }),
+    ))
+}
+
+async fn get_index_status(
+    State(state): State<AppState>,
+    AxumPath(collection): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let mut rt = state.rt.lock().await;
+    let (fields, composites, exact_fields, state_name) = rt
+        .sort_index_status(&collection)
+        .map_err(ApiError::runtime)?;
+    let composites: Vec<Value> = composites
+        .into_iter()
+        .map(|(a, b)| json!({ "fields": [a, b] }))
+        .collect();
+    Ok(Json(json!({
+        "ok": true,
+        "collection": collection,
+        "indexes": {
+            "sort": {
+                "state": state_name,
+                "fields": fields,
+                "composite_fields": composites,
+                "durability": "config_persisted_rebuild_on_startup"
+            },
+            "exact_string": {
+                "fields": exact_fields,
+                "durability": "config_persisted_rebuild_on_startup"
+            }
+        }
+    })))
 }
 
 async fn configure_sort_indexes(
@@ -246,8 +327,45 @@ async fn configure_sort_indexes(
     let active = rt
         .configure_sort_indexes(&collection, &fields)
         .map_err(ApiError::runtime)?;
+    let composite_defs: Vec<(String, String)> = body
+        .composite_sort_indexes
+        .into_iter()
+        .filter_map(|spec| {
+            if spec.fields.len() != 2 {
+                return None;
+            }
+            let a = spec.fields[0].trim().to_string();
+            let b = spec.fields[1].trim().to_string();
+            if a.is_empty() || b.is_empty() {
+                None
+            } else {
+                Some((a, b))
+            }
+        })
+        .collect();
+    let composites = rt
+        .configure_composite_sort_indexes(&collection, &composite_defs)
+        .map_err(ApiError::runtime)?;
+    let exact_string_fields = if let Some(ref ef) = body.exact_string_fields {
+        rt.configure_exact_string_index_fields(&collection, ef)
+            .map_err(ApiError::runtime)?
+    } else {
+        rt.exact_string_index_fields(&collection)
+            .map_err(ApiError::runtime)?
+    };
+    let composites_json: Vec<Value> = composites
+        .into_iter()
+        .map(|(a, b)| json!({ "fields": [a, b] }))
+        .collect();
     Ok(Json(
-        json!({ "ok": true, "collection": collection, "sort_indexes": active, "configured": true }),
+        json!({
+            "ok": true,
+            "collection": collection,
+            "sort_indexes": active,
+            "composite_sort_indexes": composites_json,
+            "exact_string_fields": exact_string_fields,
+            "configured": true
+        }),
     ))
 }
 
@@ -266,6 +384,40 @@ async fn add_sort_index(
         .map_err(ApiError::runtime)?;
     Ok(Json(
         json!({ "ok": true, "collection": collection, "sort_indexes": active, "added": field }),
+    ))
+}
+
+async fn configure_composite_sort_indexes(
+    State(state): State<AppState>,
+    AxumPath(collection): AxumPath<String>,
+    Json(body): Json<SortIndexConfigBody>,
+) -> Result<Json<Value>, ApiError> {
+    let composite_defs: Vec<(String, String)> = body
+        .composite_sort_indexes
+        .into_iter()
+        .filter_map(|spec| {
+            if spec.fields.len() != 2 {
+                return None;
+            }
+            let a = spec.fields[0].trim().to_string();
+            let b = spec.fields[1].trim().to_string();
+            if a.is_empty() || b.is_empty() {
+                None
+            } else {
+                Some((a, b))
+            }
+        })
+        .collect();
+    let mut rt = state.rt.lock().await;
+    let composites = rt
+        .configure_composite_sort_indexes(&collection, &composite_defs)
+        .map_err(ApiError::runtime)?;
+    let composites_json: Vec<Value> = composites
+        .into_iter()
+        .map(|(a, b)| json!({ "fields": [a, b] }))
+        .collect();
+    Ok(Json(
+        json!({ "ok": true, "collection": collection, "composite_sort_indexes": composites_json }),
     ))
 }
 
