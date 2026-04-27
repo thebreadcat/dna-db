@@ -1,0 +1,13 @@
+{
+  "name": "dnadb-basic-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DNA-DB local dashboard example",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

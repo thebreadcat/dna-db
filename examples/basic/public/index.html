@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DNA-DB Dashboard Example</title>
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="kicker">DNA-DB EXAMPLES/BASIC</p>
+        <h1>Query Adapters + Benchmark Telemetry</h1>
+        <p class="lead">
+          Quick local dashboard for testing adaptor semantics and reading benchmark outputs.
+          Data is loaded live from <code>bench-output/*.json</code>.
+        </p>
+      </section>
+
+      <section class="panel metrics">
+        <div>
+          <h2>Latest Benchmark Snapshot</h2>
+          <p id="bench-status">Loading benchmark data...</p>
+        </div>
+        <div class="stat-grid" id="stat-grid"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Adapter Query Equivalents</h2>
+        <p class="subtle">
+          Same logical query represented as TypeScript SDK, Postgres, GraphQL, and Mongo-style
+          syntax.
+        </p>
+        <div class="tabs" id="tabs"></div>
+        <pre class="code"><code id="code-view"></code></pre>
+      </section>
+
+      <section class="panel split">
+        <div>
+          <h2>Canonical Logical Query</h2>
+          <pre class="code"><code id="logical-view"></code></pre>
+        </div>
+        <div>
+          <h2>Sample Response + Timing</h2>
+          <pre class="code"><code id="response-view"></code></pre>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Benchmark Files</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>File</th>
+                <th>Mode</th>
+                <th>Phase</th>
+                <th>Records</th>
+                <th>Write/s</th>
+                <th>Decode/s</th>
+                <th>Point Read/s</th>
+                <th>Query s</th>
+              </tr>
+            </thead>
+            <tbody id="bench-table"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -2,7 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::guide::{Clause, GuidePattern};
+use super::ast::QueryLiteral;
+use super::guide::{Clause, GuidePattern, RangeOp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryPath {
@@ -53,6 +54,60 @@ fn estimate_index_cost(field: &str, stats: &CollectionStats) -> f64 {
     INDEX_LOOKUP_COST + expected_rows * RECORD_LOAD_COST
 }
 
+fn parse_range_operand_u64(wire: &[u8]) -> Option<u64> {
+    if let Ok(lit) = bincode::deserialize::<QueryLiteral>(wire) {
+        return match lit {
+            QueryLiteral::U64(v) => Some(v),
+            QueryLiteral::I64(v) if v >= 0 => Some(v as u64),
+            _ => None,
+        };
+    }
+    std::str::from_utf8(wire).ok()?.parse().ok()
+}
+
+/// Two range clauses on the same field: lower (GT/GTE) + upper (LT/LTE), inclusive span non-empty.
+fn indexed_between_field(pattern: &GuidePattern) -> Option<String> {
+    if pattern.clauses.len() != 2 {
+        return None;
+    }
+    let mut lower = None::<(bool, u64)>;
+    let mut upper = None::<(bool, u64)>;
+    let mut field: Option<String> = None;
+    for c in &pattern.clauses {
+        let Clause::RangeMatch {
+            field_intron,
+            operator,
+            operand_wire,
+            ..
+        } = c
+        else {
+            return None;
+        };
+        match field.as_ref() {
+            None => field = Some(field_intron.clone()),
+            Some(f) if f == field_intron => {}
+            Some(_) => return None,
+        }
+        let n = parse_range_operand_u64(operand_wire)?;
+        match operator {
+            RangeOp::GreaterThan => lower = Some((true, n)),
+            RangeOp::GreaterOrEqual => lower = Some((false, n)),
+            RangeOp::LessThan => upper = Some((true, n)),
+            RangeOp::LessOrEqual => upper = Some((false, n)),
+            RangeOp::NotEqual => return None,
+        }
+    }
+    let (lo_strict, lo) = lower?;
+    let (hi_strict, hi) = upper?;
+    let lo_inc = if lo_strict { lo.saturating_add(1) } else { lo };
+    let hi_inc = if hi_strict { hi.saturating_sub(1) } else { hi };
+    if lo_inc <= hi_inc {
+        field
+    } else {
+        None
+    }
+}
+
 fn estimate_scan_cost(pattern: &GuidePattern, stats: &CollectionStats) -> f64 {
     let skip = stats.estimated_bloom_skip_rate.clamp(0.0, 1.0);
     let remaining = stats.record_count as f64 * (1.0 - skip);
@@ -81,6 +136,14 @@ pub fn choose_path(pattern: &GuidePattern, stats: &CollectionStats) -> QueryPath
         }
     }
 
+    if pattern.includes.is_empty() && pattern.order_by.is_none() {
+        if let Some(field) = indexed_between_field(pattern) {
+            if stats.indexed_fields.contains(&field) {
+                return QueryPath::Index { field };
+            }
+        }
+    }
+
     let mut indexed_candidates: Vec<String> = pattern
         .clauses
         .iter()
@@ -96,6 +159,29 @@ pub fn choose_path(pattern: &GuidePattern, stats: &CollectionStats) -> QueryPath
         .collect();
     indexed_candidates.sort();
     indexed_candidates.dedup();
+
+    // Heuristic: point lookups with exact predicate + limit 1 should strongly
+    // prefer index path when available.
+    if pattern.clauses.len() == 1
+        && pattern.order_by.is_none()
+        && pattern.includes.is_empty()
+        && (pattern.limit.is_none() || pattern.limit == Some(1))
+    {
+        if let Some(Clause::ExactMatch { field_intron, .. }) = pattern.clauses.first() {
+            if stats.indexed_fields.contains(field_intron) {
+                let sel = stats
+                    .index_selectivity
+                    .get(field_intron)
+                    .copied()
+                    .unwrap_or(0.05);
+                if sel <= 0.05 {
+                    return QueryPath::Index {
+                        field: field_intron.clone(),
+                    };
+                }
+            }
+        }
+    }
 
     if !indexed_candidates.is_empty() {
         let scan_cost = estimate_scan_cost(pattern, stats);
@@ -118,7 +204,7 @@ pub fn choose_path(pattern: &GuidePattern, stats: &CollectionStats) -> QueryPath
 #[cfg(test)]
 mod tests {
     use crate::encoding::encode_bytes_to_codons;
-    use crate::query::guide::{Clause, GuidePattern};
+    use crate::query::guide::{Clause, GuidePattern, RangeOp};
 
     use super::{choose_path, CollectionStats, QueryPath};
 
@@ -253,6 +339,60 @@ mod tests {
         };
         let stats = CollectionStats::fake();
         assert!(matches!(choose_path(&p, &stats), QueryPath::Direct));
+    }
+
+    #[test]
+    fn planner_prefers_index_for_between_on_same_field() {
+        let p = GuidePattern {
+            collection: "c".into(),
+            clauses: vec![
+                Clause::RangeMatch {
+                    field_intron: "score".into(),
+                    operator: RangeOp::GreaterOrEqual,
+                    operand_wire: b"10".to_vec(),
+                    operand_codons: encode_bytes_to_codons(b"10"),
+                },
+                Clause::RangeMatch {
+                    field_intron: "score".into(),
+                    operator: RangeOp::LessOrEqual,
+                    operand_wire: b"20".to_vec(),
+                    operand_codons: encode_bytes_to_codons(b"20"),
+                },
+            ],
+            includes: vec![],
+            overlay: None,
+            order_by: None,
+            limit: None,
+        };
+        let mut stats = CollectionStats::fake();
+        stats.record_count = 3;
+        stats.add_index("score");
+        assert!(matches!(
+            choose_path(&p, &stats),
+            QueryPath::Index { field } if field == "score"
+        ));
+    }
+
+    #[test]
+    fn planner_prefers_index_for_point_lookup_with_limit_one() {
+        let p = GuidePattern {
+            collection: "c".into(),
+            clauses: vec![Clause::ExactMatch {
+                field_intron: "email".into(),
+                operand_wire: b"alice@x.com".to_vec(),
+                operand_codons: encode_bytes_to_codons(b"alice@x.com"),
+            }],
+            includes: vec![],
+            overlay: None,
+            order_by: None,
+            limit: Some(1),
+        };
+        let mut stats = CollectionStats::fake();
+        stats.add_index("email");
+        assert!(matches!(
+            choose_path(&p, &stats),
+            QueryPath::Index { field } if field == "email"
+        ));
     }
 }
 

@@ -9,8 +9,15 @@ logs/
 tmp/
 data/
 bench-output/
-bench-data*/
-engine/bench-data*/
+# Track bench-data/README.md; ignore bulk datasets in that folder
+/bench-data/*
+!/bench-data/README.md
+bench-data-local*/
+bench-data-matrix-*/
+engine/bench-data/*
+!/engine/bench-data/README.md
+engine/bench-data-local*/
+engine/bench-data-matrix-*/
 
 # Secrets / local env
 .env
@@ -40,3 +47,15 @@ env/
 # Packaging artifacts
 build/
 *.egg-info/
+
+# Internal working docs (local only; not published)
+/DNADB_SPEC.md
+/progress.md
+/BOTTLENECKS.md
+/ENHANCMENTS.md
+
+# Ad-hoc benchmark corpora at repo root / under engine
+/bench-data-balanced/
+/bench-data-fast/
+/bench-data-strict/
+/engine/bench-data-*/

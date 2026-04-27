@@ -3,7 +3,7 @@ use std::fs::{create_dir_all, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-use crate::codec::{BincodeStrandCodec, StrandCodec, STRAND_FORMAT_MAGIC};
+use crate::codec::{BincodeStrandCodec, STRAND_FORMAT_MAGIC};
 use crate::model::Codon;
 
 const DEFAULT_FILE_SIZE: usize = 1024 * 1024; // 1 MiB bootstrap
@@ -46,6 +46,9 @@ pub struct CollectionStorage {
     strands_len: usize,
     complement_len: usize,
     meta_len: usize,
+    strands_grow_events: u64,
+    complement_grow_events: u64,
+    meta_grow_events: u64,
     /// Highest `Strand.version` observed in the strand pool (matches WAL sequence in Stage 1 pipeline).
     pub materialized_high_water_sequence: u64,
 }
@@ -87,20 +90,50 @@ impl CollectionStorage {
             strands_len,
             complement_len,
             meta_len,
+            strands_grow_events: 0,
+            complement_grow_events: 0,
+            meta_grow_events: 0,
             materialized_high_water_sequence,
         })
     }
 
     pub fn append_strands(&mut self, bytes: &[u8]) -> Result<usize, StorageError> {
-        append_to_map(&mut self.strands_map, &mut self.strands_len, bytes)
+        let (offset, grew) = append_with_auto_grow(
+            &mut self.strands_file,
+            &mut self.strands_map,
+            &mut self.strands_len,
+            bytes,
+        )?;
+        if grew {
+            self.strands_grow_events += 1;
+        }
+        Ok(offset)
     }
 
     pub fn append_complement(&mut self, bytes: &[u8]) -> Result<usize, StorageError> {
-        append_to_map(&mut self.complement_map, &mut self.complement_len, bytes)
+        let (offset, grew) = append_with_auto_grow(
+            &mut self.complement_file,
+            &mut self.complement_map,
+            &mut self.complement_len,
+            bytes,
+        )?;
+        if grew {
+            self.complement_grow_events += 1;
+        }
+        Ok(offset)
     }
 
     pub fn append_meta(&mut self, bytes: &[u8]) -> Result<usize, StorageError> {
-        append_to_map(&mut self.meta_map, &mut self.meta_len, bytes)
+        let (offset, grew) = append_with_auto_grow(
+            &mut self.meta_file,
+            &mut self.meta_map,
+            &mut self.meta_len,
+            bytes,
+        )?;
+        if grew {
+            self.meta_grow_events += 1;
+        }
+        Ok(offset)
     }
 
     pub fn flush(&mut self) -> Result<(), StorageError> {
@@ -134,6 +167,24 @@ impl CollectionStorage {
     pub fn strand_bytes_written(&self) -> usize {
         self.strands_len
     }
+
+    /// Number of mmap growth/remap events per backing file.
+    pub fn grow_events(&self) -> (u64, u64, u64) {
+        (
+            self.strands_grow_events,
+            self.complement_grow_events,
+            self.meta_grow_events,
+        )
+    }
+
+    /// Current mmap capacities in bytes per backing file.
+    pub fn map_capacities(&self) -> (usize, usize, usize) {
+        (
+            self.strands_map.len(),
+            self.complement_map.len(),
+            self.meta_map.len(),
+        )
+    }
 }
 
 /// Scan concatenated `DNAS` strand frames; returns byte offset after last valid frame and max `Strand.version`.
@@ -146,8 +197,7 @@ fn scan_strands_tail(bytes: &[u8]) -> Result<(usize, u64), crate::codec::CodecEr
         if bytes[pos..pos + 4] != STRAND_FORMAT_MAGIC {
             break;
         }
-        let strand = codec.decode_strand(&bytes[pos..])?;
-        let len = codec.encode_strand(&strand)?.len();
+        let (strand, len) = codec.decode_strand_with_len(&bytes[pos..])?;
         max_ver = max_ver.max(strand.version);
         pos += len;
     }
@@ -209,9 +259,41 @@ fn append_to_map(map: &mut MmapMut, current_len: &mut usize, bytes: &[u8]) -> Re
     Ok(start)
 }
 
+fn append_with_auto_grow(
+    file: &mut File,
+    map: &mut MmapMut,
+    current_len: &mut usize,
+    bytes: &[u8],
+) -> Result<(usize, bool), StorageError> {
+    let grew = ensure_capacity(file, map, *current_len, bytes.len())?;
+    let offset = append_to_map(map, current_len, bytes)?;
+    Ok((offset, grew))
+}
+
+fn ensure_capacity(
+    file: &mut File,
+    map: &mut MmapMut,
+    current_len: usize,
+    append_len: usize,
+) -> Result<bool, StorageError> {
+    let required = current_len.saturating_add(append_len);
+    if required <= map.len() {
+        return Ok(false);
+    }
+
+    let mut new_size = map.len().max(DEFAULT_FILE_SIZE);
+    while new_size < required {
+        new_size = new_size.saturating_mul(2);
+    }
+    file.set_len(new_size as u64)?;
+    *map = map_mut(file)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::CollectionStorage;
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -233,5 +315,22 @@ mod tests {
         assert!(storage.paths.strands.exists());
         assert!(storage.paths.complement.exists());
         assert!(storage.paths.meta.exists());
+    }
+
+    #[test]
+    fn auto_grows_maps_when_append_exceeds_initial_size() {
+        let dir = tempdir().expect("tempdir");
+        let mut storage =
+            CollectionStorage::open_or_create(dir.path(), "users", Some(64)).expect("open");
+
+        let big = vec![b'x'; 512];
+        storage.append_strands(&big).expect("append strands");
+        storage.append_complement(&big).expect("append complement");
+        storage.append_meta(&big).expect("append meta");
+        storage.flush().expect("flush");
+
+        assert!(fs::metadata(&storage.paths.strands).expect("strands meta").len() >= 512);
+        assert!(fs::metadata(&storage.paths.complement).expect("comp meta").len() >= 512);
+        assert!(fs::metadata(&storage.paths.meta).expect("meta meta").len() >= 512);
     }
 }

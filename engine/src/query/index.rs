@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use rayon;
+
 use crate::encoding::{decode_codons_to_bytes, EncodedPayload};
 use crate::model::{Intron, Strand};
 use super::ast::QueryLiteral;
@@ -115,20 +117,62 @@ impl GlobalRangeIndex {
         Self { field, entries }
     }
 
+    /// Inclusive numeric bounds on the sorted `entries` slice (O(log n + k)).
+    pub fn lookup_between_inclusive(&self, low: u64, high: u64) -> Vec<[u8; 8]> {
+        if low > high {
+            return Vec::new();
+        }
+        let i = self.entries.partition_point(|(v, _)| *v < low);
+        let j = self.entries.partition_point(|(v, _)| *v <= high);
+        if i >= j {
+            return Vec::new();
+        }
+        let n = j - i;
+        const PARALLEL_RANGE_MIN: usize = 8192;
+        if n >= PARALLEL_RANGE_MIN {
+            let mid = i + n / 2;
+            let (left, right) = rayon::join(
+                || self.entries[i..mid].iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+                || self.entries[mid..j].iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+            );
+            let mut out = Vec::with_capacity(n);
+            out.extend(left);
+            out.extend(right);
+            return out;
+        }
+        self.entries[i..j].iter().map(|(_, s)| *s).collect()
+    }
+
     pub fn lookup(&self, op: RangeOp, needle: u64) -> Vec<[u8; 8]> {
-        self.entries
-            .iter()
-            .filter_map(|(v, sig)| {
-                let ok = match op {
-                    RangeOp::GreaterThan => *v > needle,
-                    RangeOp::GreaterOrEqual => *v >= needle,
-                    RangeOp::LessThan => *v < needle,
-                    RangeOp::LessOrEqual => *v <= needle,
-                    RangeOp::NotEqual => *v != needle,
-                };
-                if ok { Some(*sig) } else { None }
-            })
-            .collect()
+        match op {
+            RangeOp::GreaterOrEqual => {
+                let i = self.entries.partition_point(|(v, _)| *v < needle);
+                self.entries[i..].iter().map(|(_, s)| *s).collect()
+            }
+            RangeOp::GreaterThan => {
+                let i = self.entries.partition_point(|(v, _)| *v <= needle);
+                self.entries[i..].iter().map(|(_, s)| *s).collect()
+            }
+            RangeOp::LessThan => {
+                let i = self.entries.partition_point(|(v, _)| *v < needle);
+                self.entries[..i].iter().map(|(_, s)| *s).collect()
+            }
+            RangeOp::LessOrEqual => {
+                let i = self.entries.partition_point(|(v, _)| *v <= needle);
+                self.entries[..i].iter().map(|(_, s)| *s).collect()
+            }
+            RangeOp::NotEqual => self
+                .entries
+                .iter()
+                .filter_map(|(v, sig)| {
+                    if *v != needle {
+                        Some(*sig)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        }
     }
 
     pub fn save_to_path(&self, path: &Path) -> Result<(), GlobalHashIndexError> {
@@ -207,6 +251,17 @@ mod tests {
         assert!(gt_15.contains(&s3.signature));
         let lte_20 = idx.lookup(RangeOp::LessOrEqual, 20);
         assert_eq!(lte_20.len(), 2);
+    }
+
+    #[test]
+    fn global_range_index_between_inclusive_matches_sorted_slice() {
+        let s1 = strand_from_wal_payload(1, 1, b"10");
+        let s2 = strand_from_wal_payload(1, 2, b"20");
+        let s3 = strand_from_wal_payload(1, 3, b"30");
+        let idx = GlobalRangeIndex::build("_payload", &[s1.clone(), s2.clone(), s3.clone()]);
+        let mid = idx.lookup_between_inclusive(15, 25);
+        assert_eq!(mid.len(), 1);
+        assert_eq!(mid[0], s2.signature);
     }
 }
 

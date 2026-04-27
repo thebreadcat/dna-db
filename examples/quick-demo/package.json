@@ -1,0 +1,9 @@
+{
+  "name": "dnadb-example-quick-demo",
+  "private": true,
+  "version": "0.1.0",
+  "main": "run.js",
+  "scripts": {
+    "start": "node run.js"
+  }
+}

@@ -52,6 +52,17 @@ impl StrandCodec for BincodeStrandCodec {
     }
 }
 
+impl BincodeStrandCodec {
+    /// Decode one strand frame and return `(strand, frame_len_bytes)`.
+    ///
+    /// This avoids re-encoding solely to compute frame length in scan loops.
+    pub fn decode_strand_with_len(&self, bytes: &[u8]) -> Result<(Strand, usize), CodecError> {
+        let strand = self.decode_strand(bytes)?;
+        let payload_len = bincode::serialized_size(&strand)? as usize;
+        Ok((strand, 6 + payload_len))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BincodeStrandCodec, CodecError, StrandCodec, STRAND_FORMAT_MAGIC};
