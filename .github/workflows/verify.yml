@@ -5,30 +5,58 @@ on:
     branches: ["**"]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   verify:
     runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "22"
+          package-manager-cache: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install TypeScript SDK dependencies
         working-directory: sdk/typescript
         run: npm ci
 
-      - name: Run unified quick verification
-        run: python3 scripts/test_everything.py --quick
+      - name: Engine — cargo test
+        working-directory: engine
+        run: cargo test
+
+      - name: Engine — cargo check --benches
+        working-directory: engine
+        run: cargo check --benches
+
+      - name: TypeScript SDK — check & build
+        working-directory: sdk/typescript
+        run: npm run check && npm run build
+
+      - name: Python SDK — unit tests
+        working-directory: sdk/python
+        run: python3 -m unittest discover -s tests -p "test_*.py"
+
+      - name: Repo tooling — unit tests
+        run: python3 -m unittest discover -s tests -p "test_*.py"
+
+      - name: Admin inspect smoke
+        run: python3 scripts/admin_inspect.py all --json
+
+      - name: Ops check (packaging only)
+        run: python3 scripts/ops_check.py --skip-runtime --json
