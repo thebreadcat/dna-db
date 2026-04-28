@@ -1,4 +1,8 @@
-//! Layer 2 write pipeline: WAL + memtable + immutable segment flush.
+//! Layer 2 write pipeline: WAL + memtable + immutable segment flush (**raw JSON payloads**, no strands).
+//!
+//! Used by [`crate::runtime::EngineRuntime::execute_raw_segment_bulk_insert`] under `data_dir/raw_journal/<collection>/`
+//! (via inner name `"raw"`) so WAL files never collide with [`crate::transaction_durable`] `*.wal` at the data root.
+//! Strand materialization is deferred to a future segment seal / compaction step.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -40,6 +44,19 @@ struct SegmentRecord {
     record_id: u64,
     payload: Vec<u8>,
     wal_sequence: u64,
+}
+
+/// One decoded raw WAL append (after [`Wal`] framing): `(record_id, json_payload)` bincode.
+#[derive(Debug, Clone)]
+pub struct RawWalDecoded {
+    pub wal_sequence: u64,
+    pub record_id: u64,
+    pub payload_json: Vec<u8>,
+}
+
+fn decode_raw_wal_inner(payload: &[u8]) -> Result<(u64, Vec<u8>), WritePipelineError> {
+    let (record_id, payload_json): (u64, Vec<u8>) = bincode::deserialize(payload)?;
+    Ok((record_id, payload_json))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -198,6 +215,32 @@ impl LsmWritePipeline {
             }
         }
         Ok(())
+    }
+
+    /// Decode raw-journal WAL entries with sequence **≥ `from_sequence`** (typically `last_applied + 1`).
+    /// Caps at `limit` entries so callers can batch background materialization.
+    pub fn decode_raw_wal_from_sequence(
+        &mut self,
+        from_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<RawWalDecoded>, WritePipelineError> {
+        let entries = self.wal.read_entries_from(from_sequence, Some(limit.max(1)))?;
+        let mut out = Vec::with_capacity(entries.len());
+        for e in entries {
+            let (record_id, payload_json) = decode_raw_wal_inner(&e.payload)?;
+            out.push(RawWalDecoded {
+                wal_sequence: e.sequence,
+                record_id,
+                payload_json,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Highest WAL sequence present in the raw journal file (0 if empty/unreadable tail).
+    pub fn raw_wal_high_water_sequence(&mut self) -> Result<u64, WritePipelineError> {
+        let entries = self.wal.read_all_entries()?;
+        Ok(entries.last().map(|e| e.sequence).unwrap_or(0))
     }
 }
 

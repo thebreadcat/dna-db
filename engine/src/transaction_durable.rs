@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::query::{
-    choose_path, compile_query, CollectionStats, QueryAst, QueryLiteral, QueryPath, RangeOp,
-    SortDirection, WhereOp,
+    choose_path, compile_query, like_util::sql_like_prefix_literal, CollectionStats, QueryAst,
+    QueryLiteral, QueryPath, RangeOp, SortDirection, WhereOp,
 };
 use crate::codec::BincodeStrandCodec;
 use crate::processor::{process_wal_entry_with_mode, PersistMode, ProcessorError};
@@ -72,6 +72,9 @@ pub struct DurableTransactionStore {
     composite_sort_index_defs: HashSet<(String, String)>,
     /// String fields maintained in `exact_string_indexes` for equality fast paths.
     exact_string_index_fields: HashSet<String>,
+    /// Strand/complement/meta files skipped `sync_data` on the last deferred bulk commit.
+    /// Cleared by [`Self::sync_storage_to_disk`], [`Self::rebuild_sort_indexes`], or any full flush commit.
+    pending_deferred_storage_sync: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +96,8 @@ enum SnapshotQueryPlan {
 enum FastPathKind {
     CompositeSort,
     ExactIndex,
+    /// Prefix-only `LIKE 'foo%'` on an exact-string-indexed field (§13).
+    PrefixStringIndex,
     SortIndex,
 }
 
@@ -165,16 +170,17 @@ impl DurableTransactionStore {
                 .map(|[a, b]| (a, b))
                 .collect(),
             exact_string_index_fields: configured_exact,
+            pending_deferred_storage_sync: false,
         };
         out.replay_wal_to_mvcc()?;
-        out.rebuild_sort_indexes();
+        out.rebuild_sort_indexes()?;
         Ok(out)
     }
 
     pub fn configure_sort_indexes(&mut self, fields: &[String]) -> Result<(), DurableTxnError> {
         self.sort_index_fields = fields.iter().cloned().collect();
         self.persist_index_config()?;
-        self.rebuild_sort_indexes();
+        self.rebuild_sort_indexes()?;
         Ok(())
     }
 
@@ -184,7 +190,7 @@ impl DurableTransactionStore {
         }
         self.sort_index_fields.insert(field.to_string());
         self.persist_index_config()?;
-        self.rebuild_sort_indexes();
+        self.rebuild_sort_indexes()?;
         Ok(())
     }
 
@@ -194,7 +200,7 @@ impl DurableTransactionStore {
     ) -> Result<(), DurableTxnError> {
         self.composite_sort_index_defs = defs.iter().cloned().collect();
         self.persist_index_config()?;
-        self.rebuild_sort_indexes();
+        self.rebuild_sort_indexes()?;
         Ok(())
     }
 
@@ -211,7 +217,7 @@ impl DurableTransactionStore {
         self.composite_sort_index_defs
             .insert((filter.to_string(), order.to_string()));
         self.persist_index_config()?;
-        self.rebuild_sort_indexes();
+        self.rebuild_sort_indexes()?;
         Ok(())
     }
 
@@ -227,7 +233,7 @@ impl DurableTransactionStore {
             .filter(|s| !s.is_empty())
             .collect();
         self.persist_index_config()?;
-        self.rebuild_sort_indexes();
+        self.rebuild_sort_indexes()?;
         Ok(())
     }
 
@@ -312,6 +318,11 @@ impl DurableTransactionStore {
                         return (rows, SnapshotQueryPlan::ExactIndex);
                     }
                 }
+                FastPathKind::PrefixStringIndex => {
+                    if let Some(rows) = self.prefix_string_index_query_rows(txn, ast) {
+                        return (rows, SnapshotQueryPlan::ExactIndex);
+                    }
+                }
                 FastPathKind::SortIndex => {
                     if let Some(rows) = self.sort_index_query_rows(txn, ast) {
                         return (rows, SnapshotQueryPlan::SortIndex);
@@ -368,15 +379,20 @@ impl DurableTransactionStore {
     }
 
     pub fn commit(&mut self, txn: &mut Transaction) -> Result<u64, DurableTxnError> {
-        self.commit_inner(txn, true)
+        self.commit_inner(txn, true, false)
     }
 
     /// Like [`Self::commit`], but skips incremental index updates. Caller must bring indexes
     /// back in sync (typically via [`Self::rebuild_sort_indexes`]) before serving queries.
+    ///
+    /// When `defer_storage_fsync` is true: [`CollectionStorage::flush_maps`] runs and WAL is synced,
+    /// but [`CollectionStorage::sync_files`] is skipped until [`Self::sync_storage_to_disk`] or the
+    /// end of [`Self::rebuild_sort_indexes`] (indexes still need rebuilding when bulk skipped incremental indexes).
     fn commit_inner(
         &mut self,
         txn: &mut Transaction,
         apply_incremental_indexes: bool,
+        defer_storage_fsync: bool,
     ) -> Result<u64, DurableTxnError> {
         let profile = env::var_os("DNADB_COMMIT_PROFILE").is_some();
         let t0 = profile.then(Instant::now);
@@ -407,10 +423,43 @@ impl DurableTransactionStore {
             None
         };
 
+        let write_breakdown = env::var_os("DNADB_WRITE_BREAKDOWN").is_some();
+        #[derive(Default)]
+        struct WriteBreakdownAccum {
+            payload_serialize_us: u128,
+            wal_append_us: u128,
+            materialize_us: u128,
+            flush_maps_us: u128,
+            sync_files_us: u128,
+            wal_sync_us: u128,
+        }
+        let mut wb = WriteBreakdownAccum::default();
+
         let t_wal = profile.then(Instant::now);
         for op in &txn.write_set {
-            let payload = durable_payload_from_write_op(txn.txn_id, op)?;
-            let seq = self.wal.append(&payload)?;
+            let payload = if write_breakdown {
+                let tp = Instant::now();
+                let p = durable_payload_from_write_op(txn.txn_id, op)?;
+                wb.payload_serialize_us += tp.elapsed().as_micros() as u128;
+                p
+            } else {
+                durable_payload_from_write_op(txn.txn_id, op)?
+            };
+
+            let seq = if write_breakdown {
+                let ta = Instant::now();
+                let s = self.wal.append(&payload)?;
+                wb.wal_append_us += ta.elapsed().as_micros() as u128;
+                s
+            } else {
+                self.wal.append(&payload)?
+            };
+
+            let t_mat = if write_breakdown {
+                Some(Instant::now())
+            } else {
+                None
+            };
             process_wal_entry_with_mode(
                 &mut self.storage,
                 &self.codec,
@@ -419,6 +468,9 @@ impl DurableTransactionStore {
                 &payload,
                 PersistMode::Buffered,
             )?;
+            if let Some(t) = t_mat {
+                wb.materialize_us += t.elapsed().as_micros() as u128;
+            }
         }
         if profile {
             eprintln!(
@@ -429,12 +481,52 @@ impl DurableTransactionStore {
         }
 
         let t_flush = profile.then(Instant::now);
-        self.storage.flush()?;
+        let tfm = Instant::now();
+        self.storage.flush_maps()?;
+        if write_breakdown {
+            wb.flush_maps_us += tfm.elapsed().as_micros() as u128;
+        }
+        if defer_storage_fsync {
+            self.pending_deferred_storage_sync = true;
+        } else {
+            let ts = Instant::now();
+            self.storage.sync_files()?;
+            if write_breakdown {
+                wb.sync_files_us += ts.elapsed().as_micros() as u128;
+            }
+            self.pending_deferred_storage_sync = false;
+        }
+        let tw = Instant::now();
         self.wal.sync()?;
+        if write_breakdown {
+            wb.wal_sync_us += tw.elapsed().as_micros() as u128;
+            let ops = txn.write_set.len();
+            let wal_materialize_total = wb.payload_serialize_us + wb.wal_append_us + wb.materialize_us;
+            let storage_and_wal_sync = wb.flush_maps_us + wb.sync_files_us + wb.wal_sync_us;
+            let total_write_path_us = wal_materialize_total + storage_and_wal_sync;
+            eprintln!(
+                "dnadb_write_breakdown: ops={ops} \
+                 payload_serialize_us={} wal_append_us={} materialize_us={} \
+                 flush_maps_us={} sync_files_us={} wal_sync_us={} \
+                 wal_log_plus_materialize_us={wal_materialize_total} storage_plus_wal_fsync_us={storage_and_wal_sync} \
+                 total_write_path_us={total_write_path_us}",
+                wb.payload_serialize_us,
+                wb.wal_append_us,
+                wb.materialize_us,
+                wb.flush_maps_us,
+                wb.sync_files_us,
+                wb.wal_sync_us,
+            );
+            eprintln!(
+                "dnadb_write_breakdown_hint: materialize_us = strand encode + append strands/complement/CRC (grows with record size); \
+                 sync_files_us = fdatasync on strand files; set DNADB_COMMIT_PROFILE for mvcc/index slices"
+            );
+        }
         if profile {
             eprintln!(
-                "dnadb_commit_profile: storage_flush_wal_sync {}µs",
-                t_flush.expect("profile").elapsed().as_micros()
+                "dnadb_commit_profile: storage_flush_wal_sync {}µs defer_fsync={}",
+                t_flush.expect("profile").elapsed().as_micros(),
+                defer_storage_fsync
             );
         }
 
@@ -555,13 +647,14 @@ impl DurableTransactionStore {
         &mut self,
         records: Vec<Value>,
     ) -> Result<ExecutionResult, DurableTxnError> {
-        self.execute_insert_many_with_mode(records, true)
+        self.execute_insert_many_with_mode(records, true, false)
     }
 
     pub fn execute_insert_many_with_mode(
         &mut self,
         records: Vec<Value>,
         rebuild_indexes: bool,
+        defer_storage_fsync: bool,
     ) -> Result<ExecutionResult, DurableTxnError> {
         if records.is_empty() {
             return Ok(ExecutionResult::AffectedRows(0));
@@ -577,18 +670,57 @@ impl DurableTransactionStore {
         }
         // One full rebuild is far cheaper than per-row deindex + index for large batches
         // (especially for cold inserts where deindex is mostly wasted work).
-        self.commit_inner(&mut tx, false)?;
+        self.commit_inner(&mut tx, false, defer_storage_fsync)?;
         if rebuild_indexes {
-            self.rebuild_sort_indexes();
+            self.rebuild_sort_indexes()?;
         }
         Ok(ExecutionResult::AffectedRows(affected))
     }
 
-    pub fn rebuild_indexes(&mut self) {
-        self.rebuild_sort_indexes();
+    /// Same as [`Self::execute_insert_many_with_mode`] with `rebuild_indexes: false`, but uses
+    /// **incremental** sort/exact/composite index updates via [`Self::commit_inner`] (`apply_incremental_indexes: true`).
+    /// Prefer this for streaming materialization batches — avoids O(N) full [`Self::rebuild_sort_indexes`] each batch.
+    pub fn execute_insert_many_incremental_indexes(
+        &mut self,
+        records: Vec<Value>,
+        defer_storage_fsync: bool,
+    ) -> Result<ExecutionResult, DurableTxnError> {
+        if records.is_empty() {
+            return Ok(ExecutionResult::AffectedRows(0));
+        }
+        let affected = records.len();
+        let mut tx = self.begin();
+        for record in records {
+            let row = json_object_to_record(record)?;
+            let id = record_id_from_record(&row).ok_or(DurableTxnError::Transaction(
+                "record must contain numeric `id` field",
+            ))?;
+            self.upsert(&mut tx, id, row);
+        }
+        self.commit_inner(&mut tx, true, defer_storage_fsync)?;
+        Ok(ExecutionResult::AffectedRows(affected))
     }
 
-    fn rebuild_sort_indexes(&mut self) {
+    /// Full storage durability: mmap flush + `sync_data` on strand files. Clears any deferred fsync state.
+    pub fn sync_storage_to_disk(&mut self) -> Result<(), DurableTxnError> {
+        self.storage.flush()?;
+        self.pending_deferred_storage_sync = false;
+        Ok(())
+    }
+
+    pub fn rebuild_indexes(&mut self) -> Result<(), DurableTxnError> {
+        self.rebuild_sort_indexes()
+    }
+
+    fn flush_pending_deferred_storage_sync(&mut self) -> Result<(), DurableTxnError> {
+        if self.pending_deferred_storage_sync {
+            self.storage.flush()?;
+            self.pending_deferred_storage_sync = false;
+        }
+        Ok(())
+    }
+
+    fn rebuild_sort_indexes(&mut self) -> Result<(), DurableTxnError> {
         self.sort_index_sealed.clear();
         self.sort_index_active.clear();
         self.sort_index_sealed_stale.clear();
@@ -628,6 +760,9 @@ impl DurableTransactionStore {
         for (record_id, record) in visible {
             self.index_exact_and_composite_only(record_id, &record);
         }
+
+        self.flush_pending_deferred_storage_sync()?;
+        Ok(())
     }
 
     fn index_exact_and_composite_only(
@@ -947,6 +1082,49 @@ impl DurableTransactionStore {
         Some(rows)
     }
 
+    /// Prefix-only `LIKE 'foo%'` on a field in [`Self::exact_string_index_fields`], using
+    /// exact-string bucket keys (JSON string tokens) — avoids full visible scans when the
+    /// index maps a manageable number of distinct values.
+    fn prefix_string_index_query_rows(
+        &self,
+        txn: &Transaction,
+        ast: &QueryAst,
+    ) -> Option<Vec<crate::mvcc::Record>> {
+        if ast.wheres.len() != 1 || !ast.includes.is_empty() {
+            return None;
+        }
+        let w = ast.wheres.first()?;
+        if w.op != WhereOp::Like {
+            return None;
+        }
+        let QueryLiteral::String(pat) = &w.value else {
+            return None;
+        };
+        let prefix = sql_like_prefix_literal(pat)?;
+        if !self.exact_string_index_fields.contains(w.field.as_str()) {
+            return None;
+        }
+        let field_map = self.exact_string_indexes.get(&w.field)?;
+        let mut ids: HashSet<u64> = HashSet::new();
+        for (key, idset) in field_map {
+            let Some(decoded) = string_value_from_exact_index_key(key) else {
+                continue;
+            };
+            if decoded.starts_with(prefix) {
+                ids.extend(idset.iter().copied());
+            }
+        }
+        let mut rows = Vec::new();
+        for id in ids {
+            if let Some(row) = self.tx_manager.read(txn, id) {
+                if matches_record(&row, ast) {
+                    rows.push(row);
+                }
+            }
+        }
+        Some(rows)
+    }
+
     fn choose_fast_path(&self, ast: &QueryAst) -> Option<FastPathKind> {
         let mut candidates: Vec<(usize, FastPathKind)> = Vec::new();
         if let Some(cost) = self.estimate_composite_sort_cost(ast) {
@@ -954,6 +1132,9 @@ impl DurableTransactionStore {
         }
         if let Some(cost) = self.estimate_exact_index_cost(ast) {
             candidates.push((cost, FastPathKind::ExactIndex));
+        }
+        if let Some(cost) = self.estimate_prefix_string_index_cost(ast) {
+            candidates.push((cost, FastPathKind::PrefixStringIndex));
         }
         if let Some(cost) = self.estimate_sort_index_cost(ast) {
             candidates.push((cost, FastPathKind::SortIndex));
@@ -1041,6 +1222,38 @@ impl DurableTransactionStore {
             }
         }
         Some(estimated.max(limit).max(1))
+    }
+
+    fn estimate_prefix_string_index_cost(&self, ast: &QueryAst) -> Option<usize> {
+        let limit = ast.limit.map(|v| v as usize)?;
+        if ast.wheres.len() != 1 || !ast.includes.is_empty() {
+            return None;
+        }
+        let w = ast.wheres.first()?;
+        if w.op != WhereOp::Like {
+            return None;
+        }
+        let QueryLiteral::String(pat) = &w.value else {
+            return None;
+        };
+        let prefix = sql_like_prefix_literal(pat)?;
+        if !self.exact_string_index_fields.contains(w.field.as_str()) {
+            return None;
+        }
+        let field_map = self.exact_string_indexes.get(&w.field)?;
+        let mut matched_rows = 0usize;
+        for (key, idset) in field_map {
+            let Some(decoded) = string_value_from_exact_index_key(key) else {
+                continue;
+            };
+            if decoded.starts_with(prefix) {
+                matched_rows = matched_rows.saturating_add(idset.len());
+            }
+        }
+        if matched_rows == 0 {
+            return None;
+        }
+        Some(matched_rows.min(limit.saturating_mul(4)).max(1))
     }
 
     fn with_default_order_for_limit(&self, ast: &QueryAst) -> QueryAst {
@@ -1317,6 +1530,15 @@ fn canonical_literal_key(lit: &QueryLiteral) -> String {
     }
 }
 
+/// Decode a bucket key produced by [`canonical_value_key`] / JSON string serialization.
+fn string_value_from_exact_index_key(key: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(key).ok()?;
+    match v {
+        Value::String(s) => Some(s),
+        _ => None,
+    }
+}
+
 fn literal_as_f64(lit: &QueryLiteral) -> Option<f64> {
     match lit {
         QueryLiteral::I64(v) => Some(*v as f64),
@@ -1574,7 +1796,7 @@ mod tests {
             );
         }
         store.commit(&mut tx).expect("c");
-        store.rebuild_indexes();
+        store.rebuild_indexes().expect("rebuild");
         let mut tx2 = store.begin();
         store.upsert(
             &mut tx2,
@@ -1730,6 +1952,43 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("id"), Some(&json!(77)));
+    }
+
+    #[test]
+    fn prefix_like_slug_uses_exact_string_index_fast_path() {
+        let dir = tempdir().expect("tempdir");
+        let root: PathBuf = dir.path().to_path_buf();
+        let mut store =
+            DurableTransactionStore::open_or_create(&root, "posts", 1, Some(1024 * 1024))
+                .expect("open");
+        store
+            .configure_sort_indexes(&["updated_at".to_string()])
+            .expect("sort idx");
+        let docs: Vec<_> = (1..=50u64)
+            .map(|i| {
+                json!({
+                    "id": i,
+                    "updated_at": (1000 + i as i64),
+                    "slug": format!("post-{i}"),
+                })
+            })
+            .collect();
+        store.execute_insert_many(docs).expect("bulk");
+        let reader = store.begin();
+        let ast = QueryAst::new("posts")
+            .r#where(
+                "slug",
+                WhereOp::Like,
+                QueryLiteral::String("post-4%".to_string()),
+            )
+            .limit(20);
+        let (rows, plan) = store.query_with_plan(&reader, &ast);
+        assert_eq!(plan, SnapshotQueryPlan::ExactIndex);
+        assert_eq!(rows.len(), 11, "post-4 + post-40..post-49");
+        for r in &rows {
+            let slug = r.get("slug").and_then(|v| v.as_str()).expect("slug");
+            assert!(slug.starts_with("post-4"), "unexpected slug {slug}");
+        }
     }
 }
 

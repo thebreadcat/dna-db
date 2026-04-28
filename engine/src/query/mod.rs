@@ -7,6 +7,7 @@ pub mod fetch;
 pub mod guide;
 pub mod index;
 pub mod index_lifecycle;
+pub mod like_util;
 pub mod planner;
 pub mod scan;
 pub mod segment;
@@ -28,7 +29,11 @@ pub use index::{
     GlobalRangeIndex,
 };
 pub use index_lifecycle::{GlobalIndexCatalog, GlobalIndexCatalogError};
-pub use planner::{choose_path, CollectionStats, QueryPath};
+pub use like_util::sql_like_prefix_literal;
+pub use planner::{
+    choose_path, estimate_index_path_cost, estimate_scan_path_cost, CollectionStats,
+    PathCostBreakdown, QueryPath,
+};
 pub use scan::{
     scan_strands, scan_strands_parallel, scan_strands_sequential, ScanConfig,
     PARALLEL_STRAND_THRESHOLD,

@@ -22,7 +22,7 @@ crc32fast = "1.4"
 
 # Optional: HTTP lab server (`dnadb_http` binary)
 axum = { version = "0.7", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"], optional = true }
 tower-http = { version = "0.5", features = ["cors", "fs"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 
@@ -34,6 +34,10 @@ proptest = "1.6"
 [[bench]]
 name = "stage1_encode"
 harness = false
+
+[[bin]]
+name = "bench_durable_bulk"
+path = "src/bin/bench_durable_bulk.rs"
 
 [[bin]]
 name = "dnadb_http"

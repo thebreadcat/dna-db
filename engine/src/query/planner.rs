@@ -1,4 +1,6 @@
-//! Query planner path selection (direct / index / guided scan), with a simple cost model.
+//! Query planner path selection (direct / index / guided scan), with a small **three-term**
+//! cost model: **estimated rows**, **traversal**, **fetch** — pick the path with lowest total.
+//! This is the foundation for richer heuristics (prefix index, trigram, composite costs).
 
 use std::collections::{HashMap, HashSet};
 
@@ -48,10 +50,48 @@ const INCLUDE_EDGE_COST: f64 = 25.0;
 const ORDER_BY_COST_PER_RECORD: f64 = 0.02;
 const VERIFY_CLAUSE_COST: f64 = 0.03;
 
-fn estimate_index_cost(field: &str, stats: &CollectionStats) -> f64 {
+/// Planner cost split: `total = traversal_cost + fetch_cost` (same units as before).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathCostBreakdown {
+    pub estimated_rows: f64,
+    pub traversal_cost: f64,
+    pub fetch_cost: f64,
+}
+
+impl PathCostBreakdown {
+    #[inline]
+    pub fn total(self) -> f64 {
+        self.traversal_cost + self.fetch_cost
+    }
+}
+
+pub fn estimate_index_path_cost(field: &str, stats: &CollectionStats) -> PathCostBreakdown {
     let sel = stats.index_selectivity.get(field).copied().unwrap_or(0.05).clamp(0.0, 1.0);
-    let expected_rows = stats.record_count as f64 * sel;
-    INDEX_LOOKUP_COST + expected_rows * RECORD_LOAD_COST
+    let estimated_rows = stats.record_count as f64 * sel;
+    PathCostBreakdown {
+        estimated_rows,
+        traversal_cost: INDEX_LOOKUP_COST,
+        fetch_cost: estimated_rows * RECORD_LOAD_COST,
+    }
+}
+
+pub fn estimate_scan_path_cost(pattern: &GuidePattern, stats: &CollectionStats) -> PathCostBreakdown {
+    let skip = stats.estimated_bloom_skip_rate.clamp(0.0, 1.0);
+    let estimated_rows = stats.record_count as f64 * (1.0 - skip);
+    let fetch_cost =
+        estimated_rows * (pattern.clauses.len() as f64 * VERIFY_CLAUSE_COST);
+    let include = pattern.includes.len() as f64 * INCLUDE_EDGE_COST;
+    let order = if pattern.order_by.is_some() {
+        estimated_rows * ORDER_BY_COST_PER_RECORD
+    } else {
+        0.0
+    };
+    let traversal_cost = estimated_rows * SCAN_COST_PER_RECORD + include + order;
+    PathCostBreakdown {
+        estimated_rows,
+        traversal_cost,
+        fetch_cost,
+    }
 }
 
 fn parse_range_operand_u64(wire: &[u8]) -> Option<u64> {
@@ -106,19 +146,6 @@ fn indexed_between_field(pattern: &GuidePattern) -> Option<String> {
     } else {
         None
     }
-}
-
-fn estimate_scan_cost(pattern: &GuidePattern, stats: &CollectionStats) -> f64 {
-    let skip = stats.estimated_bloom_skip_rate.clamp(0.0, 1.0);
-    let remaining = stats.record_count as f64 * (1.0 - skip);
-    let verify = remaining * (pattern.clauses.len() as f64 * VERIFY_CLAUSE_COST);
-    let include = pattern.includes.len() as f64 * INCLUDE_EDGE_COST;
-    let order = if pattern.order_by.is_some() {
-        remaining * ORDER_BY_COST_PER_RECORD
-    } else {
-        0.0
-    };
-    remaining * SCAN_COST_PER_RECORD + verify + include + order
 }
 
 pub fn choose_path(pattern: &GuidePattern, stats: &CollectionStats) -> QueryPath {
@@ -184,13 +211,18 @@ pub fn choose_path(pattern: &GuidePattern, stats: &CollectionStats) -> QueryPath
     }
 
     if !indexed_candidates.is_empty() {
-        let scan_cost = estimate_scan_cost(pattern, stats);
+        let scan = estimate_scan_path_cost(pattern, stats);
+        let scan_total = scan.total();
         let best = indexed_candidates
             .iter()
-            .map(|f| (f, estimate_index_cost(f, stats)))
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        if let Some((field, idx_cost)) = best {
-            if idx_cost < scan_cost {
+            .map(|f| (f, estimate_index_path_cost(f, stats)))
+            .min_by(|a, b| {
+                a.1.total()
+                    .partial_cmp(&b.1.total())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        if let Some((field, idx)) = best {
+            if idx.total() < scan_total {
                 return QueryPath::Index {
                     field: field.clone(),
                 };
@@ -206,7 +238,39 @@ mod tests {
     use crate::encoding::encode_bytes_to_codons;
     use crate::query::guide::{Clause, GuidePattern, RangeOp};
 
-    use super::{choose_path, CollectionStats, QueryPath};
+    use super::{
+        choose_path, estimate_index_path_cost, estimate_scan_path_cost, CollectionStats, QueryPath,
+    };
+
+    #[test]
+    fn path_cost_breakdown_totals_match_composed_formula() {
+        let p = GuidePattern {
+            collection: "c".into(),
+            clauses: vec![Clause::ExactMatch {
+                field_intron: "email".into(),
+                operand_wire: b"x".to_vec(),
+                operand_codons: encode_bytes_to_codons(b"x"),
+            }],
+            includes: vec![],
+            overlay: None,
+            order_by: Some(("created_at".into(), crate::query::ast::SortDirection::Desc)),
+            limit: Some(10),
+        };
+        let mut stats = CollectionStats::fake();
+        stats.record_count = 50_000;
+        stats.estimated_bloom_skip_rate = 0.2;
+        stats.add_index("email");
+        let scan = estimate_scan_path_cost(&p, &stats);
+        assert!(scan.estimated_rows > 0.0);
+        assert_eq!(
+            scan.total(),
+            scan.traversal_cost + scan.fetch_cost,
+            "total is traversal + fetch"
+        );
+        let idx = estimate_index_path_cost("email", &stats);
+        assert!(idx.estimated_rows <= stats.record_count as f64);
+        assert!(idx.total() > 0.0);
+    }
 
     #[test]
     fn planner_chooses_direct_for_signature_lookup() {

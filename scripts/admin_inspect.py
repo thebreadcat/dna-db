@@ -14,12 +14,23 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def _read_progress(root: Path) -> str:
-    return (root / "progress.md").read_text(encoding="utf-8")
+def _read_progress(root: Path) -> str | None:
+    """Return progress.md text, or None if absent (e.g. public CI clone — file is gitignored)."""
+    path = root / "progress.md"
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8")
 
 
 def inspect_stage_status(root: Path) -> dict[str, Any]:
     text = _read_progress(root)
+    if text is None:
+        return {
+            "completed_stages": 0,
+            "total_stages": 0,
+            "stages": [],
+            "progress_md": "missing",
+        }
     stage_lines = re.findall(r"^- \[(x| )\] (Stage [0-9]+ - .+)$", text, re.MULTILINE)
     stages: list[dict[str, Any]] = []
     for mark, title in stage_lines:
@@ -29,11 +40,14 @@ def inspect_stage_status(root: Path) -> dict[str, Any]:
         "completed_stages": completed,
         "total_stages": len(stages),
         "stages": stages,
+        "progress_md": "present",
     }
 
 
 def inspect_build_completion(root: Path) -> dict[str, Any]:
     text = _read_progress(root)
+    if text is None:
+        return {"rows": [], "progress_md": "missing"}
     row_matches = re.findall(
         r"^\| \*\*(.+?)\*\* .*?\| \*\*(.+?)\*\* \| \*\*(.+?)\*\* \|$",
         text,
@@ -43,7 +57,7 @@ def inspect_build_completion(root: Path) -> dict[str, Any]:
         {"scope": scope.strip(), "complete": complete.strip(), "remaining": remaining.strip()}
         for scope, complete, remaining in row_matches
     ]
-    return {"rows": rows}
+    return {"rows": rows, "progress_md": "present"}
 
 
 def inspect_sdk_status(root: Path) -> dict[str, Any]:
@@ -85,12 +99,16 @@ def _render_text(command: str, payload: dict[str, Any]) -> str:
         lines = [
             f"Stages complete: {payload['completed_stages']}/{payload['total_stages']}",
         ]
+        if payload.get("progress_md") == "missing":
+            lines.append("(note: progress.md not in repo — stage list empty)")
         for row in payload["stages"]:
             prefix = "[x]" if row["complete"] else "[ ]"
             lines.append(f"{prefix} {row['stage']}")
         return "\n".join(lines)
     if command == "completion":
         lines = ["Build completion rows:"]
+        if payload.get("progress_md") == "missing":
+            lines.append("(note: progress.md not in repo — no rows)")
         for row in payload["rows"]:
             lines.append(
                 f"- {row['scope']}: complete={row['complete']} remaining={row['remaining']}"
