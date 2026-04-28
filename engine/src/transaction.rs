@@ -175,6 +175,10 @@ impl TransactionManager {
             .map(VersionChain::version_count)
             .unwrap_or(0)
     }
+
+    pub fn contains_record_id(&self, record_id: u64) -> bool {
+        self.chains.contains_key(&record_id)
+    }
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@
 //!   **B** — Burst: 200k fast raw writes, then measure peak lag and time until `pending_wal_sequences == 0`.
 //!   **C** — Mixed: one thread ingests, one queries, background materializer; lock-wait vs query-work split, lag, p50/p95/p99.
 //!   **D** — Equilibrium sweep: repeat short runs at several `--equilibrium-pauses` (ingest spacing) to see where mean **d(lag)/dt** crosses zero (ingest ≈ materialize).
+//!   **E** — **Matrix tracking**: run the same mixed **C** workload at `--matrix-target-rows` (default 100k,200k,500k) with optional `--stop-after-raw-rows` per tier; one JSON with `tiers[]` + `comparison[]` (writes/lag, read `query_work_ms_*`, search `text_search_work_ms_*`, combined latency).
 //!
 //! Instrumentation (A/B/C/D):
 //!   - `materialize_time_series`: each materializer tick → `records_applied`, `mat_records_per_sec`, `pending_wal_sequences_after`
@@ -27,6 +28,7 @@
 //! **Coupling note:** faster `--lag-sample-ms` or heavy visibility polling increases lock contention and can skew results — treat sample intervals as part of the experiment.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,10 +37,12 @@ use std::time::{Duration, Instant};
 use dnadb_engine::runtime::EngineRuntime;
 use dnadb_engine::transaction_durable::ExecutionResult;
 use dnadb_engine::wire::{MongoCommand, MongoFindCommand};
+use dnadb_engine::write_pipeline::LsmWritePipeline;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 const COLL: &str = "raw_bench";
+const RAW_JOURNAL_INNER: &str = "raw";
 /// Default checkpoints: 100k → 500k → 1M total raw rows (same ratios as `--phase-max-rows 1000000`).
 const MILESTONES: [u64; 3] = [100_000, 500_000, 1_000_000];
 
@@ -76,6 +80,7 @@ fn run() -> Result<(), String> {
         Scenario::B => scenario_b(&args)?,
         Scenario::C => scenario_c(&args)?,
         Scenario::D => scenario_d(&args)?,
+        Scenario::E => scenario_e(&args)?,
     };
     println!("{}", serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?);
     Ok(())
@@ -87,6 +92,8 @@ enum Scenario {
     B,
     C,
     D,
+    /// Multi-tier matrix: repeated scenario-C-style runs at configured raw row caps.
+    E,
 }
 
 /// How search ops pick the term whose posting list is scanned (bench-only inverted index).
@@ -100,6 +107,7 @@ enum SearchSelectivity {
     Mixed,
 }
 
+#[derive(Clone)]
 struct Args {
     scenario: Scenario,
     data_dir: std::path::PathBuf,
@@ -107,6 +115,10 @@ struct Args {
     /// Background materializer poll interval (active backlog path).
     mat_interval_ms: u64,
     mat_idle_ms: u64,
+    /// Background materializer decode/apply batch per lock hold (`0` = adaptive/unbounded call).
+    materializer_batch: usize,
+    /// Max materialize decode/apply rounds per scheduler tick (bounded API call budget).
+    materializer_max_batches_per_tick: usize,
     ingest_batch: usize,
     /// Scenario B burst row count.
     burst_records: u64,
@@ -151,6 +163,10 @@ struct Args {
     search_selectivity: SearchSelectivity,
     /// In `Mixed`, fraction of searches targeting `rare` (0–100).
     search_mixed_rare_query_pct: u8,
+    /// Scenario C/E: stop raw ingest after this many rows are durable-append complete (`next_id-1 >= N`). Main loop still runs full `duration_sec` for reads/search.
+    stop_after_raw_rows: Option<u64>,
+    /// Scenario E: comma-separated raw row caps (default 100000,200000,500000 if empty).
+    matrix_target_rows: Vec<u64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -158,8 +174,10 @@ fn parse_args() -> Result<Args, String> {
         scenario: Scenario::A,
         data_dir: std::path::PathBuf::from("/tmp/dnadb_bench_raw_pipeline"),
         mmap_bytes: Some(32 * 1024 * 1024),
-        mat_interval_ms: 25,
+        mat_interval_ms: 10,
         mat_idle_ms: 2_000,
+        materializer_batch: 512,
+        materializer_max_batches_per_tick: 4,
         ingest_batch: 5_000,
         burst_records: 200_000,
         duration_sec: 30,
@@ -184,6 +202,8 @@ fn parse_args() -> Result<Args, String> {
         search_rare_doc_mod: 2000,
         search_selectivity: SearchSelectivity::Mixed,
         search_mixed_rare_query_pct: 12,
+        stop_after_raw_rows: None,
+        matrix_target_rows: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -197,7 +217,8 @@ fn parse_args() -> Result<Args, String> {
                     "b" | "B" => Scenario::B,
                     "c" | "C" => Scenario::C,
                     "d" | "D" => Scenario::D,
-                    _ => return Err("use --scenario a|b|c|d".to_string()),
+                    "e" | "E" => Scenario::E,
+                    _ => return Err("use --scenario a|b|c|d|e".to_string()),
                 };
             }
             "--data-dir" => {
@@ -221,6 +242,22 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("mat-idle-ms: {e}"))?;
                 args.mat_idle_ms = n.max(1);
+            }
+            "--materializer-batch" => {
+                let n: usize = it
+                    .next()
+                    .ok_or_else(|| "--materializer-batch needs a value".to_string())?
+                    .parse()
+                    .map_err(|e| format!("materializer-batch: {e}"))?;
+                args.materializer_batch = n;
+            }
+            "--materializer-max-batches-per-tick" => {
+                let n: usize = it
+                    .next()
+                    .ok_or_else(|| "--materializer-max-batches-per-tick needs a value".to_string())?
+                    .parse()
+                    .map_err(|e| format!("materializer-max-batches-per-tick: {e}"))?;
+                args.materializer_max_batches_per_tick = n.max(1);
             }
             "--ingest-batch" => {
                 let n: usize = it
@@ -423,13 +460,42 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|e| format!("recovery-stable-hold-ms: {e}"))?;
                 args.recovery_stable_hold_ms = x.max(1.0);
             }
+            "--stop-after-raw-rows" => {
+                let n: u64 = it
+                    .next()
+                    .ok_or_else(|| "--stop-after-raw-rows needs N".to_string())?
+                    .parse()
+                    .map_err(|e| format!("stop-after-raw-rows: {e}"))?;
+                args.stop_after_raw_rows = Some(n.max(1));
+            }
+            "--matrix-target-rows" => {
+                let s = it
+                    .next()
+                    .ok_or_else(|| "--matrix-target-rows needs comma-separated row counts".to_string())?;
+                let mut v = Vec::new();
+                for part in s.split(',') {
+                    let p = part.trim();
+                    if p.is_empty() {
+                        continue;
+                    }
+                    let n: u64 = p
+                        .parse()
+                        .map_err(|e| format!("matrix-target-rows: {e}"))?;
+                    v.push(n.max(1));
+                }
+                if !v.is_empty() {
+                    args.matrix_target_rows = v;
+                }
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: bench_raw_pipeline --scenario a|b|c|d [options]\n\
+                    "Usage: bench_raw_pipeline --scenario a|b|c|d|e [options]\n\
                      \n\
                      --data-dir PATH        (default /tmp/dnadb_bench_raw_pipeline)\n\
-                     --mat-interval-ms N   (default 25) background materialize when lag>0\n\
+                     --mat-interval-ms N   (default 10) background materialize when lag>0\n\
                      --mat-idle-ms N       (default 2000) sleep when no lag (A/C/D)\n\
+                     --materializer-batch N materialize decode/apply batch per lock hold (default 512; 0 = adaptive)\n\
+                     --materializer-max-batches-per-tick N bounded materialize rounds per scheduler tick (default 4)\n\
                      --ingest-batch N      (default 5000)\n\
                      --burst N             scenario B total raw rows (default 200000)\n\
                      --duration-sec N      scenario C (default 30)\n\
@@ -454,7 +520,9 @@ fn parse_args() -> Result<Args, String> {
                      --search-scan K        id finds per op (default 20)\n\
                      --search-selectivity common|rare|mixed (default mixed)\n\
                      --search-rare-doc-mod N one rare doc every N ids (default 2000)\n\
-                     --search-mixed-rare-query-pct P in mixed mode (default 12)\n"
+                     --search-mixed-rare-query-pct P in mixed mode (default 12)\n\
+                     --stop-after-raw-rows N  C/E: stop ingest after N raw rows (main loop still runs duration_sec)\n\
+                     --matrix-target-rows N,... scenario E caps (default 100000,200000,500000)\n"
                 );
                 std::process::exit(0);
             }
@@ -880,6 +948,28 @@ fn mean_slice(v: &[f64]) -> f64 {
     }
 }
 
+fn phase_split_pair<T: Copy>(
+    xs: &[T],
+    ts_ms: &[f64],
+    ingest_stop_ms: Option<f64>,
+) -> (Vec<T>, Vec<T>) {
+    let mut ingest = Vec::new();
+    let mut drain = Vec::new();
+    for (i, &x) in xs.iter().enumerate() {
+        let t = ts_ms.get(i).copied().unwrap_or(0.0);
+        if let Some(stop_ms) = ingest_stop_ms {
+            if t <= stop_ms {
+                ingest.push(x);
+            } else {
+                drain.push(x);
+            }
+        } else {
+            ingest.push(x);
+        }
+    }
+    (ingest, drain)
+}
+
 /// Population variance (divide by N); 0 for len < 2.
 fn population_variance(xs: &[f64]) -> f64 {
     let n = xs.len();
@@ -978,6 +1068,10 @@ fn classify_regime_c(
 struct CTracePoint {
     t_ms: f64,
     lock_wait_ms: f64,
+    /// Total wall ms spent while holding the runtime mutex this iteration.
+    lock_hold_ms: f64,
+    /// Sub-slice of hold time for `raw_journal_pending_sequences`.
+    lag_check_ms: f64,
     /// `None` when `max_id < 1` (no MVCC probe this iteration).
     query_work_ms: Option<f64>,
     /// `None` when search probe off or skipped (throttled) this iteration.
@@ -1533,43 +1627,114 @@ fn build_time_bucketed_traces(
 fn start_background_materializer(
     rt: Arc<Mutex<EngineRuntime>>,
     stop: Arc<AtomicBool>,
+    data_dir: PathBuf,
     mat_interval_ms: u64,
     mat_idle_ms: u64,
+    materializer_batch: usize,
+    materializer_max_batches_per_tick: usize,
     mat_log: Arc<Mutex<Vec<MatEvent>>>,
     bench_t0: Instant,
 ) {
     thread::spawn(move || {
         let coll = COLL.to_string();
+        let mut last_applied_seq: u64 = 0;
+        let jr = data_dir.join("raw_journal").join(&coll);
+        let mut pipe = match LsmWritePipeline::open_or_create(&jr, RAW_JOURNAL_INNER, 8_192) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let trace_mat_lock = std::env::var_os("DNADB_BENCH_MAT_LOCK_TRACE").is_some();
         while !stop.load(Ordering::Relaxed) {
-            let pending_after = {
-                let mut g = match rt.lock() {
-                    Ok(x) => x,
+            let mut pending_after = 0u64;
+            let mut applied_any = false;
+            let rounds = materializer_max_batches_per_tick.max(1);
+            for _ in 0..rounds {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let bs = materializer_batch.max(1);
+                let decoded = match pipe.decode_raw_wal_from_sequence(
+                    last_applied_seq.saturating_add(1),
+                    bs,
+                ) {
+                    Ok(v) => v,
                     Err(_) => break,
                 };
-                let t_ms = bench_t0.elapsed().as_secs_f64() * 1000.0;
-                let rep = g.materialize_raw_journal_to_durable(&coll, 0);
-                let pending_after = g.raw_journal_pending_sequences(&coll).unwrap_or(0);
-                if let Ok(mut log) = mat_log.lock() {
-                    let (rap, mps, dur) = match &rep {
-                        Ok(r) => (
-                            r.records_applied as u64,
-                            r.materialization_records_per_sec,
-                            r.duration_ms,
-                        ),
-                        Err(_) => (0, None, None),
-                    };
-                    log.push(MatEvent {
-                        t_ms,
-                        records_applied: rap,
-                        mat_records_per_sec: mps,
-                        duration_ms: dur,
-                        pending_wal_sequences_after: pending_after,
-                    });
+                if decoded.is_empty() {
+                    break;
                 }
-                drop(g);
-                pending_after
-            };
-            let sleep_ms = if pending_after == 0 {
+                let mut docs: Vec<Value> = Vec::with_capacity(decoded.len());
+                let mut max_seq = last_applied_seq;
+                for d in &decoded {
+                    if let Ok(v) = serde_json::from_slice::<Value>(&d.payload_json) {
+                        docs.push(v);
+                        max_seq = max_seq.max(d.wal_sequence);
+                    }
+                }
+                let (applied, apply_hold_ms) = {
+                    let mut g = match rt.lock() {
+                        Ok(x) => x,
+                        Err(_) => return,
+                    };
+                    let hold_t0 = Instant::now();
+                    let t_ms = bench_t0.elapsed().as_secs_f64() * 1000.0;
+                    let applied = g
+                        .apply_materialized_docs_direct(
+                            &coll,
+                            docs,
+                        )
+                        .unwrap_or(0);
+                    if let Ok(mut log) = mat_log.lock() {
+                        let hw = pipe.raw_wal_high_water_sequence().unwrap_or(0);
+                        let pa = hw.saturating_sub(max_seq);
+                        let dur = hold_t0.elapsed().as_secs_f64() * 1000.0;
+                        let mps = if dur > 0.0 {
+                            Some((applied as f64) / (dur / 1000.0))
+                        } else {
+                            None
+                        };
+                        log.push(MatEvent {
+                            t_ms,
+                            records_applied: applied as u64,
+                            mat_records_per_sec: mps,
+                            duration_ms: Some(dur),
+                            pending_wal_sequences_after: pa,
+                        });
+                    }
+                    (
+                        applied as u64,
+                        hold_t0.elapsed().as_secs_f64() * 1000.0,
+                    )
+                };
+                if applied > 0 {
+                    last_applied_seq = max_seq;
+                }
+                if trace_mat_lock && apply_hold_ms > 50.0 {
+                    eprintln!("bench_mat_lock_trace: apply_hold_ms={apply_hold_ms:.3}");
+                }
+                pending_after = pipe
+                    .raw_wal_high_water_sequence()
+                    .unwrap_or(last_applied_seq)
+                    .saturating_sub(last_applied_seq);
+                if applied == 0 {
+                    break;
+                }
+                applied_any = true;
+                thread::yield_now();
+            }
+            if applied_any {
+                // One sync per scheduler tick (best-effort) so we don't force lock queuing
+                // when the runtime lock is already contended by ingest/query work.
+                let sync_t0 = Instant::now();
+                if let Ok(mut g) = rt.try_lock() {
+                    let _ = g.sync_collection_storage(&coll);
+                }
+                let sync_hold_ms = sync_t0.elapsed().as_secs_f64() * 1000.0;
+                if trace_mat_lock && sync_hold_ms > 50.0 {
+                    eprintln!("bench_mat_lock_trace: sync_hold_ms={sync_hold_ms:.3}");
+                }
+            }
+            let sleep_ms = if pending_after == 0 || !applied_any {
                 mat_idle_ms
             } else {
                 mat_interval_ms
@@ -1628,8 +1793,11 @@ fn scenario_a(args: &Args) -> Result<ScenarioOut, String> {
     start_background_materializer(
         rt.clone(),
         stop.clone(),
+        args.data_dir.clone(),
         args.mat_interval_ms,
         args.mat_idle_ms,
+        args.materializer_batch,
+        args.materializer_max_batches_per_tick,
         mat_log.clone(),
         t_start,
     );
@@ -1736,6 +1904,11 @@ fn scenario_a(args: &Args) -> Result<ScenarioOut, String> {
     m.insert("ingest_batch".to_string(), json!(args.ingest_batch));
     m.insert("mat_interval_ms".to_string(), json!(args.mat_interval_ms));
     m.insert("mat_idle_ms".to_string(), json!(args.mat_idle_ms));
+    m.insert("materializer_batch".to_string(), json!(args.materializer_batch));
+    m.insert(
+        "materializer_max_batches_per_tick".to_string(),
+        json!(args.materializer_max_batches_per_tick),
+    );
     m.insert("total_wall_sec".to_string(), json!(total_sec));
     m.insert(
         "overall_ingest_rows_per_sec".to_string(),
@@ -1850,8 +2023,11 @@ fn scenario_b(args: &Args) -> Result<ScenarioOut, String> {
     start_background_materializer(
         rt.clone(),
         stop.clone(),
+        args.data_dir.clone(),
         args.mat_interval_ms,
         args.mat_idle_ms,
+        args.materializer_batch,
+        args.materializer_max_batches_per_tick,
         mat_log.clone(),
         t0,
     );
@@ -1913,6 +2089,11 @@ fn scenario_b(args: &Args) -> Result<ScenarioOut, String> {
     m.insert("drain_to_zero_sec".to_string(), json!(drain_sec));
     m.insert("drain_reached_zero".to_string(), json!(recovered));
     m.insert("mat_interval_ms".to_string(), json!(args.mat_interval_ms));
+    m.insert("materializer_batch".to_string(), json!(args.materializer_batch));
+    m.insert(
+        "materializer_max_batches_per_tick".to_string(),
+        json!(args.materializer_max_batches_per_tick),
+    );
     m.insert("materialize_time_series".to_string(), json!(mat_events));
     m.insert(
         "mat_nonzero_tick_mean_records_per_sec".to_string(),
@@ -1924,7 +2105,8 @@ fn scenario_b(args: &Args) -> Result<ScenarioOut, String> {
     })
 }
 
-fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
+/// Mixed ingest + MVCC read probe + optional search (scenario **C**); also used by **E** per tier.
+fn scenario_mixed_workload(args: &Args) -> Result<HashMap<String, Value>, String> {
     let t0 = Instant::now();
     let rare_mod = rare_doc_mod_from_args(args);
     let postings: Arc<Mutex<PostingsMap>> = Arc::new(Mutex::new(HashMap::new()));
@@ -1933,12 +2115,20 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
         args.mmap_bytes,
     )));
     let stop = Arc::new(AtomicBool::new(false));
+    let ingest_done = Arc::new(AtomicBool::new(false));
+    let ingest_stop_ms_micros = Arc::new(AtomicU64::new(0));
+    let ingest_cap = args.stop_after_raw_rows;
+    let ingest_done_ing = ingest_done.clone();
+    let ingest_stop_ms_ing = ingest_stop_ms_micros.clone();
     let mat_log = Arc::new(Mutex::new(Vec::<MatEvent>::new()));
     start_background_materializer(
         rt.clone(),
         stop.clone(),
+        args.data_dir.clone(),
         args.mat_interval_ms,
         args.mat_idle_ms,
+        args.materializer_batch,
+        args.materializer_max_batches_per_tick,
         mat_log.clone(),
         t0,
     );
@@ -1963,7 +2153,7 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
         } else {
             bench_t0_ing
         };
-        while !st.load(Ordering::Relaxed) {
+        while !st.load(Ordering::Relaxed) && !ingest_done_ing.load(Ordering::Relaxed) {
             if burst_period > 0 && Instant::now() >= next_burst {
                 let t_ms = bench_t0_ing.elapsed().as_secs_f64() * 1000.0;
                 if let Ok(mut g) = burst_times_ing.lock() {
@@ -1974,6 +2164,7 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
                 while remain > 0
                     && Instant::now() < deadline
                     && !st.load(Ordering::Relaxed)
+                    && !ingest_done_ing.load(Ordering::Relaxed)
                 {
                     let start = ni.load(Ordering::Relaxed);
                     let chunk = (b as u64).min(remain) as usize;
@@ -1990,9 +2181,19 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
                     if search_en_ing {
                         register_row_range(&postings_ing, start, chunk, rare_mod);
                     }
+                    if ingest_cap.is_some_and(|c| ni.load(Ordering::Relaxed).saturating_sub(1) >= c) {
+                        ingest_done_ing.store(true, Ordering::Relaxed);
+                        let us =
+                            (bench_t0_ing.elapsed().as_secs_f64() * 1_000_000.0).round() as u64;
+                        ingest_stop_ms_ing.store(us, Ordering::Relaxed);
+                        break;
+                    }
                     remain = remain.saturating_sub(chunk as u64);
                 }
                 next_burst += Duration::from_secs(burst_period);
+            }
+            if ingest_done_ing.load(Ordering::Relaxed) {
+                break;
             }
             let start = ni.load(Ordering::Relaxed);
             {
@@ -2004,6 +2205,12 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
             ni.fetch_add(b as u64, Ordering::Relaxed);
             if search_en_ing {
                 register_row_range(&postings_ing, start, b, rare_mod);
+            }
+            if ingest_cap.is_some_and(|c| ni.load(Ordering::Relaxed).saturating_sub(1) >= c) {
+                ingest_done_ing.store(true, Ordering::Relaxed);
+                let us =
+                    (bench_t0_ing.elapsed().as_secs_f64() * 1_000_000.0).round() as u64;
+                ingest_stop_ms_ing.store(us, Ordering::Relaxed);
             }
             if pause > 0 {
                 thread::sleep(Duration::from_millis(pause));
@@ -2047,7 +2254,9 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
         let t_acquire = Instant::now();
         let mut g = rt.lock().map_err(|e| e.to_string())?;
         let wait_ms = t_acquire.elapsed().as_secs_f64() * 1000.0;
+        let t_lag = Instant::now();
         let lag = g.raw_journal_pending_sequences(COLL).unwrap_or(0);
+        let lag_check_ms = t_lag.elapsed().as_secs_f64() * 1000.0;
         lags.push(lag);
         lag_track.push(SustainedSample {
             t_ms,
@@ -2079,6 +2288,8 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
         trace_points.push(CTracePoint {
             t_ms,
             lock_wait_ms: wait_ms,
+            lock_hold_ms: t_acquire.elapsed().as_secs_f64() * 1000.0,
+            lag_check_ms,
             query_work_ms: q_work,
             text_search_work_ms: ts_work,
             combined_client_ms: combined,
@@ -2090,8 +2301,20 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
     stop.store(true, Ordering::Relaxed);
     let _ = _ing.join();
     thread::sleep(Duration::from_millis(200));
+    let ingest_stop_ms = if ingest_done.load(Ordering::Relaxed) {
+        let us = ingest_stop_ms_micros.load(Ordering::Relaxed);
+        if us > 0 {
+            Some(us as f64 / 1000.0)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let lock_wait_ms: Vec<f64> = trace_points.iter().map(|p| p.lock_wait_ms).collect();
+    let lock_hold_ms: Vec<f64> = trace_points.iter().map(|p| p.lock_hold_ms).collect();
+    let lag_check_ms: Vec<f64> = trace_points.iter().map(|p| p.lag_check_ms).collect();
     let query_work_ms: Vec<f64> = trace_points
         .iter()
         .filter_map(|p| p.query_work_ms)
@@ -2103,6 +2326,11 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
     let combined_client_ms: Vec<f64> = trace_points
         .iter()
         .map(|p| p.combined_client_ms)
+        .collect();
+    let trace_t_ms: Vec<f64> = trace_points.iter().map(|p| p.t_ms).collect();
+    let lag_series_f64: Vec<f64> = trace_points
+        .iter()
+        .map(|p| p.pending_wal_sequences as f64)
         .collect();
 
     let end_p50 = percentile_of(combined_client_ms.clone(), 0.50);
@@ -2200,6 +2428,16 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
         "end_to_end_client_ms_p99".to_string(),
         json!(end_p99),
     );
+    let (ing_combined, drain_combined) =
+        phase_split_pair(&combined_client_ms, &trace_t_ms, ingest_stop_ms);
+    m.insert(
+        "end_to_end_client_ms_p99_ingest".to_string(),
+        json!(percentile_of(ing_combined.clone(), 0.99)),
+    );
+    m.insert(
+        "end_to_end_client_ms_p99_drain".to_string(),
+        json!(percentile_of(drain_combined.clone(), 0.99)),
+    );
     m.insert(
         "lock_wait_ms_p50".to_string(),
         json!(percentile_of(lock_wait_ms.clone(), 0.5)),
@@ -2211,6 +2449,40 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
     m.insert(
         "lock_wait_ms_p99".to_string(),
         json!(percentile_of(lock_wait_ms.clone(), 0.99)),
+    );
+    m.insert(
+        "rt_lock_hold_ms_p50".to_string(),
+        json!(percentile_of(lock_hold_ms.clone(), 0.5)),
+    );
+    m.insert(
+        "rt_lock_hold_ms_p95".to_string(),
+        json!(percentile_of(lock_hold_ms.clone(), 0.95)),
+    );
+    m.insert(
+        "rt_lock_hold_ms_p99".to_string(),
+        json!(percentile_of(lock_hold_ms.clone(), 0.99)),
+    );
+    m.insert(
+        "lag_check_ms_p99".to_string(),
+        json!(percentile_of(lag_check_ms.clone(), 0.99)),
+    );
+    let (ing_lock, drain_lock) = phase_split_pair(&lock_wait_ms, &trace_t_ms, ingest_stop_ms);
+    let (ing_hold, drain_hold) = phase_split_pair(&lock_hold_ms, &trace_t_ms, ingest_stop_ms);
+    m.insert(
+        "lock_wait_ms_p99_ingest".to_string(),
+        json!(percentile_of(ing_lock.clone(), 0.99)),
+    );
+    m.insert(
+        "lock_wait_ms_p99_drain".to_string(),
+        json!(percentile_of(drain_lock.clone(), 0.99)),
+    );
+    m.insert(
+        "rt_lock_hold_ms_p99_ingest".to_string(),
+        json!(percentile_of(ing_hold.clone(), 0.99)),
+    );
+    m.insert(
+        "rt_lock_hold_ms_p99_drain".to_string(),
+        json!(percentile_of(drain_hold.clone(), 0.99)),
     );
     m.insert(
         "query_work_ms_p50".to_string(),
@@ -2226,6 +2498,25 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
     );
     m.insert("query_path_samples".to_string(), json!(query_work_ms.len()));
     m.insert("iteration_samples".to_string(), json!(combined_client_ms.len()));
+    let (ing_lag, drain_lag) = phase_split_pair(&lag_series_f64, &trace_t_ms, ingest_stop_ms);
+    m.insert(
+        "lag_p99_ingest".to_string(),
+        json!(percentile_of(ing_lag.clone(), 0.99)),
+    );
+    m.insert(
+        "lag_p99_drain".to_string(),
+        json!(percentile_of(drain_lag.clone(), 0.99)),
+    );
+    m.insert("lag_mean_ingest".to_string(), json!(mean_slice(&ing_lag)));
+    m.insert("lag_mean_drain".to_string(), json!(mean_slice(&drain_lag)));
+    m.insert(
+        "lag_max_ingest".to_string(),
+        json!(ing_lag.iter().copied().fold(0.0_f64, f64::max)),
+    );
+    m.insert(
+        "lag_max_drain".to_string(),
+        json!(drain_lag.iter().copied().fold(0.0_f64, f64::max)),
+    );
     m.insert(
         "queries_with_pending_wal_over_10k".to_string(),
         json!(high_lag_queries),
@@ -2251,6 +2542,30 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
         "mean_d_lag_d_t_wal_sequences_per_sec_raw".to_string(),
         json!(mean_slice(&d_lag_vals)),
     );
+    let deriv_t_ms: Vec<f64> = lag_deriv_smooth_c.iter().map(|d| d.t_ms).collect();
+    let (ing_d, drain_d) = phase_split_pair(&d_lag_smooth_vals, &deriv_t_ms, ingest_stop_ms);
+    m.insert(
+        "mean_d_lag_d_t_wal_sequences_per_sec_ingest".to_string(),
+        json!(mean_slice(&ing_d)),
+    );
+    m.insert(
+        "mean_d_lag_d_t_wal_sequences_per_sec_drain".to_string(),
+        json!(mean_slice(&drain_d)),
+    );
+    m.insert(
+        "lag_derivative_p99_abs_ingest".to_string(),
+        json!(percentile_of(
+            ing_d.iter().map(|x| x.abs()).collect::<Vec<_>>(),
+            0.99
+        )),
+    );
+    m.insert(
+        "lag_derivative_p99_abs_drain".to_string(),
+        json!(percentile_of(
+            drain_d.iter().map(|x| x.abs()).collect::<Vec<_>>(),
+            0.99
+        )),
+    );
     m.insert("materialize_time_series".to_string(), json!(mat_events));
     m.insert(
         "mat_nonzero_tick_mean_records_per_sec".to_string(),
@@ -2266,6 +2581,11 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
     );
     m.insert("lag_sample_ms".to_string(), json!(args.lag_sample_ms));
     m.insert("trace_bucket_ms".to_string(), json!(args.trace_bucket_ms));
+    m.insert("materializer_batch".to_string(), json!(args.materializer_batch));
+    m.insert(
+        "materializer_max_batches_per_tick".to_string(),
+        json!(args.materializer_max_batches_per_tick),
+    );
     m.insert("burst_period_sec".to_string(), json!(args.burst_period_sec));
     m.insert("burst_size".to_string(), json!(args.burst_size));
     m.insert("burst_inject_ms".to_string(), json!(args.burst_inject_ms));
@@ -2293,9 +2613,94 @@ fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
             serde_json::to_value(&tb).map_err(|e| e.to_string())?,
         );
     }
+    if let Some(cap) = args.stop_after_raw_rows {
+        m.insert("stop_after_raw_rows".to_string(), json!(cap));
+    }
+    m.insert("ingest_stopped".to_string(), json!(ingest_done.load(Ordering::Relaxed)));
+    m.insert("ingest_stop_t_ms".to_string(), json!(ingest_stop_ms));
+    Ok(m)
+}
+
+fn scenario_c(args: &Args) -> Result<ScenarioOut, String> {
+    let m = scenario_mixed_workload(args)?;
     Ok(ScenarioOut {
         scenario: "C_mixed".to_string(),
         payload: m,
+    })
+}
+
+fn matrix_comparison_row(target_raw_rows: u64, m: &HashMap<String, Value>) -> Value {
+    let pick = |k: &str| m.get(k).cloned().unwrap_or(Value::Null);
+    json!({
+        "target_raw_rows": target_raw_rows,
+        "rows_ingested_end": pick("rows_ingested_end"),
+        "lag_max": pick("lag_max"),
+        "lag_mean": pick("lag_mean"),
+        "mean_d_lag_d_t_wal_sequences_per_sec": pick("mean_d_lag_d_t_wal_sequences_per_sec"),
+        "mat_nonzero_tick_mean_records_per_sec": pick("mat_nonzero_tick_mean_records_per_sec"),
+        "query_work_ms_p50": pick("query_work_ms_p50"),
+        "query_work_ms_p99": pick("query_work_ms_p99"),
+        "text_search_work_ms_p50": pick("text_search_work_ms_p50"),
+        "text_search_work_ms_p99": pick("text_search_work_ms_p99"),
+        "text_search_path_samples": pick("text_search_path_samples"),
+        "end_to_end_client_ms_p99": pick("end_to_end_client_ms_p99"),
+        "end_to_end_client_ms_p99_ingest": pick("end_to_end_client_ms_p99_ingest"),
+        "end_to_end_client_ms_p99_drain": pick("end_to_end_client_ms_p99_drain"),
+        "lock_wait_ms_p99": pick("lock_wait_ms_p99"),
+        "lock_wait_ms_p99_ingest": pick("lock_wait_ms_p99_ingest"),
+        "lock_wait_ms_p99_drain": pick("lock_wait_ms_p99_drain"),
+        "rt_lock_hold_ms_p99": pick("rt_lock_hold_ms_p99"),
+        "rt_lock_hold_ms_p99_ingest": pick("rt_lock_hold_ms_p99_ingest"),
+        "rt_lock_hold_ms_p99_drain": pick("rt_lock_hold_ms_p99_drain"),
+        "lag_check_ms_p99": pick("lag_check_ms_p99"),
+        "lag_p99_ingest": pick("lag_p99_ingest"),
+        "lag_p99_drain": pick("lag_p99_drain"),
+        "mean_d_lag_d_t_wal_sequences_per_sec_ingest": pick("mean_d_lag_d_t_wal_sequences_per_sec_ingest"),
+        "mean_d_lag_d_t_wal_sequences_per_sec_drain": pick("mean_d_lag_d_t_wal_sequences_per_sec_drain"),
+    })
+}
+
+/// Run **scenario C**-style tracking at each `--matrix-target-rows` cap (default 100k, 200k, 500k) for apples-to-apples write/read/search curves.
+fn scenario_e(args: &Args) -> Result<ScenarioOut, String> {
+    let targets = if args.matrix_target_rows.is_empty() {
+        vec![100_000u64, 200_000, 500_000]
+    } else {
+        args.matrix_target_rows.clone()
+    };
+    let mut tiers: Vec<Value> = Vec::new();
+    let mut comparison: Vec<Value> = Vec::new();
+    for (idx, &r) in targets.iter().enumerate() {
+        let sub = args
+            .data_dir
+            .join(format!("matrix_tier_{idx}_{r}raw"));
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).map_err(|e| e.to_string())?;
+        let mut tier_args = args.clone();
+        tier_args.data_dir = sub;
+        tier_args.stop_after_raw_rows = Some(r);
+        let m = scenario_mixed_workload(&tier_args)?;
+        comparison.push(matrix_comparison_row(r, &m));
+        tiers.push(json!({
+            "tier_index": idx,
+            "target_raw_rows": r,
+            "tracking": m,
+        }));
+    }
+    let mut payload: HashMap<String, Value> = HashMap::new();
+    payload.insert(
+        "pipeline".to_string(),
+        json!("matrix_tracking: repeated mixed raw→mat→read+search workloads"),
+    );
+    payload.insert("matrix_target_rows".to_string(), json!(&targets));
+    payload.insert("comparison".to_string(), json!(comparison));
+    payload.insert("tiers".to_string(), json!(tiers));
+    payload.insert(
+        "note".to_string(),
+        json!("Each tier uses its own data subdirectory. Ingest stops at target_raw_rows; sampling continues for full --duration-sec. Enable --search-enabled to populate search metrics."),
+    );
+    Ok(ScenarioOut {
+        scenario: "E_matrix_tracking".to_string(),
+        payload,
     })
 }
 
@@ -2326,8 +2731,11 @@ fn scenario_d(args: &Args) -> Result<ScenarioOut, String> {
         start_background_materializer(
             rt.clone(),
             stop.clone(),
+            step_dir.clone(),
             args.mat_interval_ms,
             args.mat_idle_ms,
+            args.materializer_batch,
+            args.materializer_max_batches_per_tick,
             mat_log.clone(),
             t0,
         );
@@ -2686,6 +3094,11 @@ fn scenario_d(args: &Args) -> Result<ScenarioOut, String> {
     m.insert("ingest_batch".to_string(), json!(args.ingest_batch));
     m.insert("mat_interval_ms".to_string(), json!(args.mat_interval_ms));
     m.insert("mat_idle_ms".to_string(), json!(args.mat_idle_ms));
+    m.insert("materializer_batch".to_string(), json!(args.materializer_batch));
+    m.insert(
+        "materializer_max_batches_per_tick".to_string(),
+        json!(args.materializer_max_batches_per_tick),
+    );
     m.insert("lag_sample_ms".to_string(), json!(args.lag_sample_ms));
     m.insert("search_enabled".to_string(), json!(args.search_enabled));
     m.insert("search_qps".to_string(), json!(args.search_qps));

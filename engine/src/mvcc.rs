@@ -28,21 +28,31 @@ impl VersionChain {
     }
 
     pub fn insert_version(&mut self, record: Record, txn_id: u64, ts: u64) {
-        self.versions.push(VersionEntry {
+        let ver = VersionEntry {
             txn_id,
             ts,
             record: Some(record),
-        });
-        self.versions.sort_by_key(|v| v.ts);
+        };
+        if self.versions.last().map(|v| v.ts) < Some(ts) {
+            self.versions.push(ver);
+        } else {
+            let pos = self.versions.partition_point(|v| v.ts <= ts);
+            self.versions.insert(pos, ver);
+        }
     }
 
     pub fn delete(&mut self, txn_id: u64, ts: u64) {
-        self.versions.push(VersionEntry {
+        let ver = VersionEntry {
             txn_id,
             ts,
             record: None,
-        });
-        self.versions.sort_by_key(|v| v.ts);
+        };
+        if self.versions.last().map(|v| v.ts) < Some(ts) {
+            self.versions.push(ver);
+        } else {
+            let pos = self.versions.partition_point(|v| v.ts <= ts);
+            self.versions.insert(pos, ver);
+        }
     }
 
     /// Visible value at snapshot timestamp `snapshot_ts`.

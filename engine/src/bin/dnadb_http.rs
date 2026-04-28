@@ -144,16 +144,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "warning: --raw-materialize-interval-ms set without --raw-materialize-collections; skipping background materializer"
         );
     } else if !args.raw_materialize_collections.is_empty() {
-        if args.raw_materialize_interval_ms.is_none() {
-            eprintln!(
-                "warning: --raw-materialize-collections set without --raw-materialize-interval-ms; skipping background materializer"
-            );
-        } else {
-            let state_bg = state.clone();
-            let interval_ms = args
-                .raw_materialize_interval_ms
-                .expect("checked")
-                .max(10);
+        let state_bg = state.clone();
+        let interval_ms = args
+            .raw_materialize_interval_ms
+            .or_else(|| {
+                std::env::var("DNADB_RAW_MATERIALIZE_INTERVAL_MS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .unwrap_or(10)
+            .max(1);
             let batch = args
                 .raw_materialize_batch
                 .or_else(|| {
@@ -161,12 +161,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .ok()
                         .and_then(|s| s.parse::<usize>().ok())
                 })
-                .unwrap_or(0);
+                .unwrap_or(512)
+                .max(1);
+            let max_batches_per_tick = std::env::var("DNADB_RAW_MATERIALIZE_MAX_BATCHES_PER_TICK")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(4)
+                .max(1);
             let idle_ms = std::env::var("DNADB_RAW_MATERIALIZE_IDLE_MS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(2_000)
-                .max(10);
+                .max(1);
             let collections: Vec<String> = args
                 .raw_materialize_collections
                 .iter()
@@ -174,35 +180,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .filter(|s| !s.is_empty())
                 .collect();
             eprintln!(
-                "background materialize: collections={collections:?} active={interval_ms}ms idle={idle_ms}ms batch={}",
-                if batch == 0 {
-                    "adaptive"
-                } else {
-                    "fixed"
-                }
+                "background materialize: collections={collections:?} active={interval_ms}ms idle={idle_ms}ms batch={batch} max_batches_per_tick={max_batches_per_tick}"
             );
-            tokio::spawn(async move {
-                loop {
+        tokio::spawn(async move {
+            loop {
                     let mut max_lag = 0u64;
-                    {
-                        let mut rt = state_bg.rt.lock().await;
-                        for c in &collections {
-                            match rt.materialize_raw_journal_to_durable(c, batch) {
-                                Ok(r) if r.records_applied > 0 => {
-                                    eprintln!(
-                                        "raw_materialize: collection={c} applied={} through_seq={}",
-                                        r.records_applied, r.last_applied_wal_sequence
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!("raw_materialize error: collection={c} {e}");
-                                }
-                                _ => {}
+                    for c in &collections {
+                        let mut applied_total = 0usize;
+                        let mut last_applied = None::<u64>;
+                        for _ in 0..max_batches_per_tick {
+                            let apply = {
+                                let mut rt = state_bg.rt.lock().await;
+                                rt.materialize_raw_journal_apply_only_bounded(c, batch, 1)
+                            };
+                            match apply {
+                                Ok(r) => {
+                                    if r.records_applied == 0 {
+                                        break;
+                                    }
+                                    applied_total = applied_total.saturating_add(r.records_applied);
+                                    last_applied = Some(r.last_applied_wal_sequence);
                             }
-                            if let Ok(lag) = rt.raw_journal_pending_sequences(c) {
-                                max_lag = max_lag.max(lag);
+                                Err(e) => {
+                                    eprintln!("raw_materialize apply error: collection={c} {e}");
+                                    break;
+                                }
                             }
                         }
+                        if applied_total > 0 {
+                            if let Ok(mut rt) = state_bg.rt.try_lock() {
+                                if let Err(e) = rt.sync_collection_storage(c) {
+                                    eprintln!("raw_materialize sync error: collection={c} {e}");
+                                }
+                            }
+                            eprintln!(
+                                "raw_materialize: collection={c} applied={applied_total} through_seq={}",
+                                last_applied.unwrap_or(0)
+                            );
+                        }
+                        let lag = {
+                            let mut rt = state_bg.rt.lock().await;
+                            rt.raw_journal_pending_sequences(c).unwrap_or(0)
+                        };
+                        max_lag = max_lag.max(lag);
                     }
                     let target = std::env::var("DNADB_RAW_TARGET_PENDING_SEQUENCES")
                         .ok()
@@ -218,10 +238,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             sleep_ms = (interval_ms / 4).max(10);
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-                }
-            });
-        }
+                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            }
+        });
     }
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;

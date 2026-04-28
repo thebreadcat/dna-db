@@ -239,6 +239,23 @@ impl EngineRuntime {
         Ok(n)
     }
 
+    /// Apply already-decoded materialized docs directly into durable MVCC + indexes.
+    /// Used by benchmark schedulers that decode raw journal outside the runtime mutex.
+    pub fn apply_materialized_docs_direct(
+        &mut self,
+        collection: &str,
+        docs: Vec<Value>,
+    ) -> Result<usize, RuntimeError> {
+        if docs.is_empty() {
+            return Ok(0);
+        }
+        let store = self.ensure_store(collection)?;
+        match store.execute_insert_many_materialize_direct(docs)? {
+            ExecutionResult::AffectedRows(n) => Ok(n),
+            ExecutionResult::QueryRows(_) => Ok(0),
+        }
+    }
+
     /// Background Option A: replay raw-journal WAL (ordered) into the durable MVCC store using
     /// **incremental indexes** per batch (`commit_inner(..., apply_incremental_indexes=true)`).
     /// Saves checkpoint after each batch; ends with **`sync_collection_storage`** only — no full O(N) index rebuild.
@@ -253,6 +270,48 @@ impl EngineRuntime {
         &mut self,
         collection: &str,
         batch_records: usize,
+    ) -> Result<MaterializationReport, RuntimeError> {
+        self.materialize_raw_journal_to_durable_inner(collection, batch_records, None, true)
+    }
+
+    /// Like [`Self::materialize_raw_journal_to_durable`], but caps inner decode/apply rounds per call.
+    /// Useful for low-latency schedulers that want to release outer locks between small materialize slices.
+    pub fn materialize_raw_journal_to_durable_bounded(
+        &mut self,
+        collection: &str,
+        batch_records: usize,
+        max_batches_per_call: usize,
+    ) -> Result<MaterializationReport, RuntimeError> {
+        self.materialize_raw_journal_to_durable_inner(
+            collection,
+            batch_records,
+            Some(max_batches_per_call.max(1)),
+            true,
+        )
+    }
+
+    /// Apply up to `max_batches_per_call` decode/apply rounds and persist materialize checkpoint,
+    /// but skip durable-store fsync. Caller can invoke [`Self::sync_collection_storage`] separately.
+    pub fn materialize_raw_journal_apply_only_bounded(
+        &mut self,
+        collection: &str,
+        batch_records: usize,
+        max_batches_per_call: usize,
+    ) -> Result<MaterializationReport, RuntimeError> {
+        self.materialize_raw_journal_to_durable_inner(
+            collection,
+            batch_records,
+            Some(max_batches_per_call.max(1)),
+            false,
+        )
+    }
+
+    fn materialize_raw_journal_to_durable_inner(
+        &mut self,
+        collection: &str,
+        batch_records: usize,
+        max_batches_per_call: Option<usize>,
+        sync_storage: bool,
     ) -> Result<MaterializationReport, RuntimeError> {
         let adaptive = batch_records == 0;
         let fixed_batch = if batch_records == 0 {
@@ -316,17 +375,24 @@ impl EngineRuntime {
             }
 
             let store = self.ensure_store(collection)?;
-            store.execute_insert_many_incremental_indexes(docs, true)?;
+            store.execute_insert_many_materialize_direct(docs)?;
 
             state.last_applied_wal_sequence = max_seq;
             self.save_raw_materialize_state(collection, &state)?;
             records_applied += decoded.len();
             batches += 1;
+            if let Some(maxb) = max_batches_per_call {
+                if batches >= maxb {
+                    break;
+                }
+            }
         }
 
         // Indexes maintained incrementally per batch; strand fsync batched via defer across commits.
         if records_applied > 0 {
-            self.sync_collection_storage(collection)?;
+            if sync_storage {
+                self.sync_collection_storage(collection)?;
+            }
             let dur_ms = t_start.elapsed().as_secs_f64() * 1000.0;
             let rps = if dur_ms > 0.0 {
                 Some((records_applied as f64) / (dur_ms / 1000.0))

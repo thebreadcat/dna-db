@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::query::{
-    choose_path, compile_query, like_util::sql_like_prefix_literal, CollectionStats, QueryAst,
-    QueryLiteral, QueryPath, RangeOp, SortDirection, WhereOp,
+    choose_path, compile_query, like_util::sql_like_contains_literal,
+    like_util::sql_like_prefix_literal, CollectionStats, QueryAst, QueryLiteral, QueryPath,
+    RangeOp, SortDirection, WhereOp,
 };
 use crate::codec::BincodeStrandCodec;
 use crate::processor::{process_wal_entry_with_mode, PersistMode, ProcessorError};
@@ -67,6 +68,8 @@ pub struct DurableTransactionStore {
     sort_index_values: HashMap<String, HashMap<u64, i64>>,
     exact_string_indexes: HashMap<String, HashMap<String, HashSet<u64>>>,
     exact_string_index_values: HashMap<u64, Vec<(String, String)>>,
+    text_trigram_indexes: HashMap<String, HashMap<String, HashSet<u64>>>,
+    text_trigram_index_values: HashMap<u64, Vec<(String, Vec<String>)>>,
     composite_sort_indexes: HashMap<(String, String), HashMap<String, BTreeSet<SortIndexEntry>>>,
     composite_sort_index_values: HashMap<(String, String), HashMap<u64, (String, i64)>>,
     composite_sort_index_defs: HashSet<(String, String)>,
@@ -98,6 +101,8 @@ enum FastPathKind {
     ExactIndex,
     /// Prefix-only `LIKE 'foo%'` on an exact-string-indexed field (§13).
     PrefixStringIndex,
+    /// Contains-only `LIKE '%foo%'` using a trigram postings index.
+    ContainsStringIndex,
     SortIndex,
 }
 
@@ -163,6 +168,8 @@ impl DurableTransactionStore {
             sort_index_values: HashMap::new(),
             exact_string_indexes: HashMap::new(),
             exact_string_index_values: HashMap::new(),
+            text_trigram_indexes: HashMap::new(),
+            text_trigram_index_values: HashMap::new(),
             composite_sort_indexes: HashMap::new(),
             composite_sort_index_values: HashMap::new(),
             composite_sort_index_defs: configured_composites
@@ -320,6 +327,11 @@ impl DurableTransactionStore {
                 }
                 FastPathKind::PrefixStringIndex => {
                     if let Some(rows) = self.prefix_string_index_query_rows(txn, ast) {
+                        return (rows, SnapshotQueryPlan::ExactIndex);
+                    }
+                }
+                FastPathKind::ContainsStringIndex => {
+                    if let Some(rows) = self.contains_string_index_query_rows(txn, ast) {
                         return (rows, SnapshotQueryPlan::ExactIndex);
                     }
                 }
@@ -701,6 +713,53 @@ impl DurableTransactionStore {
         Ok(ExecutionResult::AffectedRows(affected))
     }
 
+    /// Materializer fast-path: decode/apply into MVCC + indexes directly.
+    /// Intentionally skips WAL/storage write path because records already exist in raw journal.
+    pub fn execute_insert_many_materialize_direct(
+        &mut self,
+        records: Vec<Value>,
+    ) -> Result<ExecutionResult, DurableTxnError> {
+        if records.is_empty() {
+            return Ok(ExecutionResult::AffectedRows(0));
+        }
+        let mat_phases = env::var_os("DNADB_MAT_PHASES_PROFILE").is_some();
+        let t_start = Instant::now();
+        let affected = records.len();
+        let mut tx = self.begin();
+        let mut existed_before: Vec<bool> = Vec::with_capacity(affected);
+        let t_exist = Instant::now();
+        for record in records {
+            let row = json_object_to_record(record)?;
+            let id = record_id_from_record(&row).ok_or(DurableTxnError::Transaction(
+                "record must contain numeric `id` field",
+            ))?;
+            existed_before.push(self.tx_manager.contains_record_id(id));
+            self.upsert(&mut tx, id, row);
+        }
+        let exist_us = t_exist.elapsed().as_micros();
+        let t_txmgr = Instant::now();
+        self.tx_manager
+            .can_commit(&tx)
+            .map_err(DurableTxnError::Transaction)?;
+        let pending_writes = tx.write_set.clone();
+        self.tx_manager
+            .commit(&mut tx)
+            .map_err(DurableTxnError::Transaction)?;
+        let txmgr_us = t_txmgr.elapsed().as_micros();
+        let t_index = Instant::now();
+        self.apply_sort_index_writes_materialized(&pending_writes, &existed_before);
+        let index_us = t_index.elapsed().as_micros();
+        if mat_phases {
+            let total_us = t_start.elapsed().as_micros();
+            let per_rec_us = total_us as f64 / affected.max(1) as f64;
+            eprintln!(
+                "MAT_PHASES n={} total={}us exist={}us txmgr={}us index={}us per_rec_us={:.2}",
+                affected, total_us, exist_us, txmgr_us, index_us, per_rec_us
+            );
+        }
+        Ok(ExecutionResult::AffectedRows(affected))
+    }
+
     /// Full storage durability: mmap flush + `sync_data` on strand files. Clears any deferred fsync state.
     pub fn sync_storage_to_disk(&mut self) -> Result<(), DurableTxnError> {
         self.storage.flush()?;
@@ -727,6 +786,8 @@ impl DurableTransactionStore {
         self.sort_index_values.clear();
         self.exact_string_indexes.clear();
         self.exact_string_index_values.clear();
+        self.text_trigram_indexes.clear();
+        self.text_trigram_index_values.clear();
         self.composite_sort_indexes.clear();
         self.composite_sort_index_values.clear();
 
@@ -771,10 +832,11 @@ impl DurableTransactionStore {
         record: &crate::mvcc::Record,
     ) {
         let mut exact_values_for_record = Vec::new();
+        let mut trigram_values_for_record = Vec::new();
         for (field, value) in record {
-            if !matches!(value, Value::String(_)) {
+            let Value::String(text) = value else {
                 continue;
-            }
+            };
             if !self.exact_string_index_fields.contains(field.as_str()) {
                 continue;
             }
@@ -786,10 +848,25 @@ impl DurableTransactionStore {
                 .or_default()
                 .insert(record_id);
             exact_values_for_record.push((field.clone(), key));
+            let grams = trigrams_for_text(text);
+            if !grams.is_empty() {
+                let field_trigrams = self.text_trigram_indexes.entry(field.clone()).or_default();
+                for gram in &grams {
+                    field_trigrams
+                        .entry(gram.clone())
+                        .or_default()
+                        .insert(record_id);
+                }
+                trigram_values_for_record.push((field.clone(), grams));
+            }
         }
         if !exact_values_for_record.is_empty() {
             self.exact_string_index_values
                 .insert(record_id, exact_values_for_record);
+        }
+        if !trigram_values_for_record.is_empty() {
+            self.text_trigram_index_values
+                .insert(record_id, trigram_values_for_record);
         }
 
         let defs: Vec<(String, String)> = self.composite_sort_index_defs.iter().cloned().collect();
@@ -830,6 +907,29 @@ impl DurableTransactionStore {
         }
     }
 
+    fn apply_sort_index_writes_materialized(
+        &mut self,
+        writes: &[WriteOp],
+        existed_before: &[bool],
+    ) {
+        let mut upsert_i = 0usize;
+        for op in writes {
+            match op {
+                WriteOp::Upsert { record_id, record } => {
+                    let existed = existed_before.get(upsert_i).copied().unwrap_or(true);
+                    if existed {
+                        self.deindex_record(*record_id);
+                    }
+                    self.index_record_values(*record_id, record);
+                    upsert_i = upsert_i.saturating_add(1);
+                }
+                WriteOp::Delete { record_id } => {
+                    self.deindex_record(*record_id);
+                }
+            }
+        }
+    }
+
     fn deindex_record(&mut self, record_id: u64) {
         let fields: Vec<String> = self.sort_index_fields.iter().cloned().collect();
         for field in fields {
@@ -861,6 +961,17 @@ impl DurableTransactionStore {
                 if let Some(values) = self.exact_string_indexes.get_mut(&field) {
                     if let Some(ids) = values.get_mut(&key) {
                         ids.remove(&record_id);
+                    }
+                }
+            }
+        }
+        if let Some(items) = self.text_trigram_index_values.remove(&record_id) {
+            for (field, grams) in items {
+                if let Some(postings) = self.text_trigram_indexes.get_mut(&field) {
+                    for gram in grams {
+                        if let Some(ids) = postings.get_mut(&gram) {
+                            ids.remove(&record_id);
+                        }
                     }
                 }
             }
@@ -1125,6 +1236,46 @@ impl DurableTransactionStore {
         Some(rows)
     }
 
+    /// Contains-only `LIKE '%foo%'` on an exact-string-indexed field using trigram postings.
+    fn contains_string_index_query_rows(
+        &self,
+        txn: &Transaction,
+        ast: &QueryAst,
+    ) -> Option<Vec<crate::mvcc::Record>> {
+        if ast.wheres.len() != 1 || !ast.includes.is_empty() {
+            return None;
+        }
+        let w = ast.wheres.first()?;
+        if w.op != WhereOp::Like {
+            return None;
+        }
+        let QueryLiteral::String(pat) = &w.value else {
+            return None;
+        };
+        let needle = sql_like_contains_literal(pat)?;
+        if !self.exact_string_index_fields.contains(w.field.as_str()) {
+            return None;
+        }
+        let mut ids = candidate_ids_for_contains(self.text_trigram_indexes.get(&w.field)?, needle)?;
+        if ids.is_empty() {
+            return Some(Vec::new());
+        }
+        if let Some(limit) = ast.limit.map(|v| v as usize) {
+            if ids.len() > limit.saturating_mul(8) {
+                ids.truncate(limit.saturating_mul(8));
+            }
+        }
+        let mut rows = Vec::new();
+        for id in ids {
+            if let Some(row) = self.tx_manager.read(txn, id) {
+                if matches_record(&row, ast) {
+                    rows.push(row);
+                }
+            }
+        }
+        Some(rows)
+    }
+
     fn choose_fast_path(&self, ast: &QueryAst) -> Option<FastPathKind> {
         let mut candidates: Vec<(usize, FastPathKind)> = Vec::new();
         if let Some(cost) = self.estimate_composite_sort_cost(ast) {
@@ -1135,6 +1286,9 @@ impl DurableTransactionStore {
         }
         if let Some(cost) = self.estimate_prefix_string_index_cost(ast) {
             candidates.push((cost, FastPathKind::PrefixStringIndex));
+        }
+        if let Some(cost) = self.estimate_contains_string_index_cost(ast) {
+            candidates.push((cost, FastPathKind::ContainsStringIndex));
         }
         if let Some(cost) = self.estimate_sort_index_cost(ast) {
             candidates.push((cost, FastPathKind::SortIndex));
@@ -1254,6 +1408,38 @@ impl DurableTransactionStore {
             return None;
         }
         Some(matched_rows.min(limit.saturating_mul(4)).max(1))
+    }
+
+    fn estimate_contains_string_index_cost(&self, ast: &QueryAst) -> Option<usize> {
+        let limit = ast.limit.map(|v| v as usize)?;
+        if ast.wheres.len() != 1 || !ast.includes.is_empty() {
+            return None;
+        }
+        let w = ast.wheres.first()?;
+        if w.op != WhereOp::Like {
+            return None;
+        }
+        let QueryLiteral::String(pat) = &w.value else {
+            return None;
+        };
+        let needle = sql_like_contains_literal(pat)?;
+        let postings = self.text_trigram_indexes.get(&w.field)?;
+        let grams = trigrams_for_text(needle);
+        if grams.is_empty() {
+            return None;
+        }
+        let mut min_posting = usize::MAX;
+        for gram in grams {
+            let len = postings.get(&gram).map(|ids| ids.len()).unwrap_or(0);
+            if len == 0 {
+                return Some(1);
+            }
+            min_posting = min_posting.min(len);
+        }
+        if min_posting == usize::MAX {
+            return None;
+        }
+        Some(min_posting.min(limit.saturating_mul(4)).max(1))
     }
 
     fn with_default_order_for_limit(&self, ast: &QueryAst) -> QueryAst {
@@ -1570,6 +1756,42 @@ fn record_id_from_record(record: &crate::mvcc::Record) -> Option<u64> {
         Some(Value::Number(n)) => n.as_u64().or_else(|| n.as_i64().and_then(|v| u64::try_from(v).ok())),
         _ => None,
     }
+}
+
+fn trigrams_for_text(value: &str) -> Vec<String> {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() < 3 {
+        return Vec::new();
+    }
+    let mut grams = HashSet::new();
+    for i in 0..=(chars.len() - 3) {
+        let gram: String = chars[i..i + 3].iter().collect();
+        grams.insert(gram);
+    }
+    let mut out: Vec<String> = grams.into_iter().collect();
+    out.sort();
+    out
+}
+
+fn candidate_ids_for_contains(
+    postings: &HashMap<String, HashSet<u64>>,
+    needle: &str,
+) -> Option<Vec<u64>> {
+    let grams = trigrams_for_text(needle);
+    if grams.is_empty() {
+        return None;
+    }
+    let mut acc: Option<HashSet<u64>> = None;
+    for gram in grams {
+        let ids = postings.get(&gram)?;
+        acc = Some(match acc {
+            None => ids.clone(),
+            Some(existing) => existing.intersection(ids).copied().collect(),
+        });
+    }
+    let mut out: Vec<u64> = acc.unwrap_or_default().into_iter().collect();
+    out.sort_unstable();
+    Some(out)
 }
 
 fn matches_record(record: &crate::mvcc::Record, ast: &QueryAst) -> bool {
@@ -1988,6 +2210,45 @@ mod tests {
         for r in &rows {
             let slug = r.get("slug").and_then(|v| v.as_str()).expect("slug");
             assert!(slug.starts_with("post-4"), "unexpected slug {slug}");
+        }
+    }
+
+    #[test]
+    fn contains_like_uses_trigram_fast_path() {
+        let dir = tempdir().expect("tempdir");
+        let root: PathBuf = dir.path().to_path_buf();
+        let mut store =
+            DurableTransactionStore::open_or_create(&root, "posts", 1, Some(1024 * 1024))
+                .expect("open");
+        let docs: Vec<_> = (1..=500u64)
+            .map(|i| {
+                let body = if i % 10 == 0 {
+                    format!("breaking news item {i} with dnadb launch notes")
+                } else {
+                    format!("routine update item {i}")
+                };
+                json!({
+                    "id": i,
+                    "slug": format!("post-{i}"),
+                    "title": body,
+                })
+            })
+            .collect();
+        store.execute_insert_many(docs).expect("bulk");
+        let reader = store.begin();
+        let ast = QueryAst::new("posts")
+            .r#where(
+                "title",
+                WhereOp::Like,
+                QueryLiteral::String("%dnadb launch%".to_string()),
+            )
+            .limit(100);
+        let (rows, plan) = store.query_with_plan(&reader, &ast);
+        assert_eq!(plan, SnapshotQueryPlan::ExactIndex);
+        assert!(!rows.is_empty());
+        for r in &rows {
+            let title = r.get("title").and_then(|v| v.as_str()).expect("title");
+            assert!(title.contains("dnadb launch"));
         }
     }
 }

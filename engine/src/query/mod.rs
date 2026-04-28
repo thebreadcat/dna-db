@@ -29,7 +29,7 @@ pub use index::{
     GlobalRangeIndex,
 };
 pub use index_lifecycle::{GlobalIndexCatalog, GlobalIndexCatalogError};
-pub use like_util::sql_like_prefix_literal;
+pub use like_util::{sql_like_contains_literal, sql_like_prefix_literal};
 pub use planner::{
     choose_path, estimate_index_path_cost, estimate_scan_path_cost, CollectionStats,
     PathCostBreakdown, QueryPath,
