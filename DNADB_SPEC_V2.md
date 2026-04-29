@@ -1,97 +1,33 @@
 # DNADB Spec V2 (Implemented Architecture)
 
-This document supersedes projection-only notes with the architecture that is now implemented and benchmark-validated.
+This document describes the **single durable write path** in the engine: all inserts go through `DurableTransactionStore` (collection WAL, strand materialization, MVCC, indexes). There is **no separate raw journal** or background materializer.
 
-## Raw Journal + Materializer Architecture
+## Write path
 
-DNADB uses a two-phase write path for high-throughput ingest:
+1. Client sends documents (HTTP bulk, wire insert, etc.).
+2. `commit_inner` (or `execute_insert_many` / `execute_mongo_insert_many_with_mode`):
+   - Append each operation to the collection **durable WAL** (`<collection>.wal`).
+   - Materialize to strand/complement/meta files (`process_wal_entry_with_mode`).
+   - `flush_maps`, optional deferred `sync_files`, then `wal.sync()` per commit policy.
+   - `tx_manager.commit` and incremental index updates (`apply_sort_index_writes`).
 
-1. **Fast append (ingest path)**
-   - Raw JSON docs are appended to `raw_journal/<collection>/raw.wal` via `LsmWritePipeline`.
-   - This path avoids MVCC/index maintenance on the request critical path.
-2. **Background apply (materializer path)**
-   - A materializer replays WAL-order records into the durable MVCC store.
-   - Materialization preserves deterministic sequence ordering and updates query-visible state.
+Success returned to the client implies the configured durability mode has been met (strict vs deferred strand fsync).
 
-The runtime tracks per-collection materialization checkpoints in `materialize_state.json`:
-- `last_applied_wal_sequence`
-- last non-empty apply wall-time and record-count stats
+## Read path
 
-This yields bounded write latency while preserving ordered durability and eventual query visibility.
+Queries compile to `QueryAst`, use MVCC visibility, sort/exact/trigram/composite indexes as configured, then overlay masking on the HTTP wire.
 
-## Direct Apply Path
+## Startup
 
-Materialization now uses a direct apply fast path:
+1. Open `DurableTransactionStore`: scan strand pool, open WAL.
+2. `replay_wal_to_mvcc`: rebuild in-memory MVCC from durable WAL entries.
+3. `rebuild_sort_indexes` (and related index structures) from visible MVCC state.
+4. HTTP server may **pre-warm** sort index probes before accepting traffic (`dnadb_http --prewarm-indexes`).
 
-- `EngineRuntime::apply_materialized_docs_direct(...)`
-- `DurableTransactionStore::execute_insert_many_materialize_direct(...)`
+## Compaction (future / checklist #8)
 
-Key behavior:
-- Skips second append/write-pipeline loops during materialization.
-- Applies already decoded records directly to MVCC and incremental indexes.
-- Uses optimized existence checks and MVCC insert behavior for monotonic write timestamps.
+Raw-segment merge and `raw_journal/` compaction are **removed**. WAL rotation / sealing old WAL files after replay is the intended simplification; not all of that may be implemented yet—see `RELEASE_CANDIDATE_CHECKLIST.md`.
 
-Result: materializer work is dominated by pure apply/index cost, not duplicate write plumbing.
+## Historical note
 
-## Bounded Batch Scheduler
-
-Production scheduler behavior is bounded and lock-aware:
-
-- **Batch size:** `512`
-- **Max batches per tick:** `4`
-- **Tick interval:** `10ms`
-
-Execution shape per tick:
-1. Decode each bounded batch from raw WAL.
-2. Hold runtime lock only for direct apply of decoded docs.
-3. Release lock between per-batch rounds.
-4. Perform storage sync in a separate lock scope after apply rounds.
-
-This design keeps lock hold times short and prevents long critical sections from decode/fsync work.
-
-## Validated Performance Characteristics
-
-The following values are measured outputs from the implemented harness and runtime path.
-
-| Metric | Start | Current | Improvement |
-|---|---:|---:|---:|
-| Writes (strict) | 54/s | 136,000/s | 2,518x |
-| Write scaling | O(N^2) | O(N) | fixed |
-| P99 ingest latency | 3,353ms | 5.55ms | 604x |
-| Lock hold P99 | 3,282ms | 5.68ms | 578x |
-| CMS seed @ 200k | 204s | ~22s | 9x |
-
-1M scenario E validation:
-- `rows_ingested_end = 1,000,000`
-- `lag_p99_ingest = 0.0`
-- `end_to_end_client_ms_p99_ingest = 5.551333`
-- `rt_lock_hold_ms_p99_ingest = 5.676875`
-- No measurable drain backlog (`lag_max = 0`)
-
-Operational conclusion: ingest/materializer behavior is linear at the validated 1M tier with zero ingest-phase lag accumulation.
-
-## Group Commit Tuning
-
-Group-commit semantics are explicitly documented and currently tuned as:
-
-- Raw ingest: append-first with deferred materialization apply.
-- Durable apply: bounded incremental commits with deferred sync orchestration.
-- Deferred sync is explicitly flushed via runtime sync calls and rebuild boundaries.
-
-Current validated tuning:
-- Keep apply batches small and frequent (`512 x 4 @ 10ms`) to reduce lock hold variance.
-- Separate sync from apply critical sections.
-- Use relative + rate-aware recovery criteria in benchmark analysis for stable convergence detection.
-
-## Production Defaults
-
-Promoted defaults:
-
-```toml
-[materializer]
-batch_size = 512
-max_batches_per_tick = 4
-interval_ms = 10
-```
-
-These values are no longer experimental benchmark knobs; they are the validated baseline for current production behavior.
+Earlier versions used a two-phase **raw journal + materializer** design for ingest. That path duplicated IO (raw + durable) after crash-safety required full durable persistence on apply. The project **dropped the raw journal** in favor of direct durable writes for simpler correctness and better throughput on the validated CMS seed path.

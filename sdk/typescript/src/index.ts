@@ -34,9 +34,26 @@ export interface InsertRequest<TRecord extends Record<string, unknown>> {
   record: TRecord;
 }
 
+export interface ConfigureCollectionRequest {
+  collection: string;
+  sortIndexes: string[];
+  compositeSortIndexes?: [string, string][];
+  exactStringFields?: string[];
+}
+
+export interface ConfigureCollectionResult {
+  collection: string;
+  sortIndexes: string[];
+  compositeSortIndexes: [string, string][];
+  exactStringFields: string[];
+}
+
 export interface Transport {
   insert<TRecord extends Record<string, unknown>>(request: InsertRequest<TRecord>): Promise<TRecord>;
   query<TRecord extends Record<string, unknown>>(request: QueryRequest): Promise<TRecord[]>;
+  configureCollection(
+    request: ConfigureCollectionRequest
+  ): Promise<ConfigureCollectionResult>;
 }
 
 export class NotImplementedTransport implements Transport {
@@ -48,6 +65,12 @@ export class NotImplementedTransport implements Transport {
 
   async query<TRecord extends Record<string, unknown>>(_request: QueryRequest): Promise<TRecord[]> {
     throw new Error("DNADB transport not configured: query is unavailable.");
+  }
+
+  async configureCollection(
+    _request: ConfigureCollectionRequest
+  ): Promise<ConfigureCollectionResult> {
+    throw new Error("DNADB transport not configured: configureCollection is unavailable.");
   }
 }
 
@@ -77,6 +100,23 @@ export class CollectionClient<TRecord extends Record<string, unknown>> {
     return this.transport.insert<TRecord>({
       collection: this.collectionName,
       record,
+    });
+  }
+
+  async configure(config: {
+    sortIndexes: string[];
+    compositeSortIndexes?: [string, string][];
+    exactStringFields?: string[];
+  }): Promise<ConfigureCollectionResult> {
+    return this.transport.configureCollection({
+      collection: this.collectionName,
+      sortIndexes: [...config.sortIndexes],
+      compositeSortIndexes: config.compositeSortIndexes
+        ? [...config.compositeSortIndexes]
+        : undefined,
+      exactStringFields: config.exactStringFields
+        ? [...config.exactStringFields]
+        : undefined,
     });
   }
 

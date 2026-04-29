@@ -1,0 +1,21 @@
+services:
+  dnadb:
+    build: .
+    image: dnadb/server:rc-1
+    ports:
+      - "8787:8787"
+      - "27017:27017"
+    volumes:
+      - dnadb_data:/data
+    environment:
+      DNADB_LOG_LEVEL: info
+      DNADB_MAX_CONNECTIONS: 1000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8787/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  dnadb_data:

@@ -25,6 +25,9 @@ axum = { version = "0.7", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"], optional = true }
 tower-http = { version = "0.5", features = ["cors", "fs"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -46,4 +49,4 @@ required-features = ["http_server"]
 
 [features]
 default = []
-http_server = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:clap"]
+http_server = ["dep:axum", "dep:tokio", "dep:tower-http", "dep:clap", "dep:axum-server", "dep:tracing", "dep:tracing-subscriber"]

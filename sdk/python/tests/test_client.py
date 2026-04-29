@@ -1,13 +1,20 @@
 import unittest
 
 from dnadb import DNAdb, DNAdbClientConfig
-from dnadb.client import InsertRequest, QueryRequest, Transport
+from dnadb.client import (
+    ConfigureCollectionRequest,
+    ConfigureCollectionResult,
+    InsertRequest,
+    QueryRequest,
+    Transport,
+)
 
 
 class InMemoryTransport(Transport):
     def __init__(self) -> None:
         self.insert_calls: list[InsertRequest] = []
         self.query_calls: list[QueryRequest] = []
+        self.configure_calls: list[ConfigureCollectionRequest] = []
         self.query_result: list[dict] = []
 
     def insert(self, request: InsertRequest):
@@ -17,6 +24,15 @@ class InMemoryTransport(Transport):
     def query(self, request: QueryRequest):
         self.query_calls.append(request)
         return self.query_result
+
+    def configure_collection(self, request: ConfigureCollectionRequest):
+        self.configure_calls.append(request)
+        return ConfigureCollectionResult(
+            collection=request.collection,
+            sort_indexes=list(request.sort_indexes),
+            composite_sort_indexes=list(request.composite_sort_indexes),
+            exact_string_fields=list(request.exact_string_fields or []),
+        )
 
 
 class PythonSdkClientTests(unittest.TestCase):
@@ -70,6 +86,24 @@ class PythonSdkClientTests(unittest.TestCase):
         builder = db.collection("users").query()
         with self.assertRaises(ValueError):
             builder.limit(0)
+
+    def test_collection_configure_routes_to_transport(self):
+        transport = InMemoryTransport()
+        db = DNAdb(
+            DNAdbClientConfig(host="127.0.0.1", port=27017, database="app"),
+            transport=transport,
+        )
+        result = db.collection("products").configure(
+            sort_indexes=["price", "created_at", "rating"],
+            composite_sort_indexes=[("status", "updated_at")],
+            exact_string_fields=["sku", "title"],
+        )
+        self.assertEqual(result.collection, "products")
+        self.assertEqual(result.sort_indexes, ["price", "created_at", "rating"])
+        self.assertEqual(result.composite_sort_indexes, [("status", "updated_at")])
+        self.assertEqual(result.exact_string_fields, ["sku", "title"])
+        self.assertEqual(len(transport.configure_calls), 1)
+        self.assertEqual(transport.configure_calls[0].collection, "products")
 
 
 if __name__ == "__main__":

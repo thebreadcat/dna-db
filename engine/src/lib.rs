@@ -31,4 +31,3 @@ pub mod transfer;
 pub mod tls;
 pub mod wal;
 pub mod wire;
-pub mod write_pipeline;

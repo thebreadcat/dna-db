@@ -29,6 +29,7 @@ pub enum WalError {
 
 pub struct Wal {
     path: PathBuf,
+    next_sequence_hint_path: PathBuf,
     file: File,
     next_sequence: u64,
 }
@@ -37,6 +38,7 @@ impl Wal {
     pub fn open_or_create(root: &Path, collection: &str) -> Result<Self, WalError> {
         create_dir_all(root)?;
         let path = root.join(format!("{collection}.wal"));
+        let next_sequence_hint_path = root.join(format!("{collection}.wal.nextseq"));
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -44,11 +46,17 @@ impl Wal {
             .append(true)
             .open(&path)?;
 
-        let next_sequence = initialize_and_scan(&mut file)?;
+        let scanned_next_sequence = initialize_and_scan(&mut file)?;
+        let hinted_next_sequence = std::fs::read_to_string(&next_sequence_hint_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(1);
+        let next_sequence = scanned_next_sequence.max(hinted_next_sequence);
         file.seek(SeekFrom::End(0))?;
 
         Ok(Self {
             path,
+            next_sequence_hint_path,
             file,
             next_sequence,
         })
@@ -60,6 +68,10 @@ impl Wal {
 
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
+    }
+
+    pub fn file_size_bytes(&self) -> Result<u64, WalError> {
+        Ok(std::fs::metadata(&self.path)?.len())
     }
 
     /// Append one entry without forcing fsync.
@@ -142,6 +154,21 @@ impl Wal {
             entries.truncate(max);
         }
         Ok(entries)
+    }
+
+    /// Drops all current WAL entries while preserving sequence monotonicity for future appends.
+    /// A sidecar `*.wal.nextseq` file stores the next sequence floor across restarts.
+    pub fn truncate_preserve_next_sequence(&mut self) -> Result<(), WalError> {
+        let keep_next = self.next_sequence.max(1);
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(&WAL_MAGIC)?;
+        self.file.write_all(&WAL_VERSION.to_le_bytes())?;
+        self.file.sync_data()?;
+        self.file.seek(SeekFrom::End(0))?;
+        std::fs::write(&self.next_sequence_hint_path, keep_next.to_string())?;
+        self.next_sequence = keep_next;
+        Ok(())
     }
 }
 
@@ -253,5 +280,24 @@ mod tests {
         assert_eq!(from_two.len(), 1);
         assert_eq!(from_two[0].sequence, 2);
         assert_eq!(from_two[0].payload, b"two");
+    }
+
+    #[test]
+    fn wal_truncate_preserves_sequence_monotonicity() {
+        let dir = tempdir().expect("tempdir");
+        let mut wal = Wal::open_or_create(dir.path(), "users").expect("open wal");
+        wal.append_and_fsync(b"one").expect("append one");
+        wal.append_and_fsync(b"two").expect("append two");
+        assert_eq!(wal.next_sequence(), 3);
+        wal.truncate_preserve_next_sequence().expect("truncate");
+        let entries = wal.read_all_entries().expect("read after truncate");
+        assert!(entries.is_empty(), "entries should be removed");
+        let seq = wal.append_and_fsync(b"three").expect("append three");
+        assert_eq!(seq, 3, "sequence should continue after truncate");
+        drop(wal);
+
+        let mut reopened = Wal::open_or_create(dir.path(), "users").expect("reopen wal");
+        let seq2 = reopened.append_and_fsync(b"four").expect("append four");
+        assert_eq!(seq2, 4, "reopen should preserve next sequence hint");
     }
 }

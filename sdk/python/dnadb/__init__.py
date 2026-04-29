@@ -2,6 +2,8 @@
 
 from .client import (
     CollectionClient,
+    ConfigureCollectionRequest,
+    ConfigureCollectionResult,
     DNAdb,
     DNAdbClientConfig,
     NotImplementedTransport,
@@ -14,6 +16,8 @@ __all__ = [
     "__version__",
     "DNAdbClientConfig",
     "QueryRequest",
+    "ConfigureCollectionRequest",
+    "ConfigureCollectionResult",
     "Transport",
     "NotImplementedTransport",
     "DNAdb",

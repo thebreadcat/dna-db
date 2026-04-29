@@ -1,28 +1,33 @@
 //! Minimal HTTP surface over `EngineRuntime` for local apps (CMS lab, scripts).
 //!
 //! Build: `cargo build --release --features http_server --bin dnadb_http`
-//!
-//! Backpressure: set `DNADB_RAW_MAX_PENDING_WAL` to cap raw-journal lag; `DNADB_RAW_CRITICAL_PENDING` for a
-//! stricter halt (503). Adaptive materialize: `batch_records == 0` in the engine, or omit
-//! `DNADB_RAW_MATERIALIZE_BATCH` / `materialize_batch_size`. See `DNADB_RAW_TARGET_PENDING_SEQUENCES`,
-//! `DNADB_RAW_MATERIALIZE_IDLE_MS`, and related env in the runtime.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path as AxumPath, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::extract::Request;
 use axum::{Json, Router};
+use dnadb_engine::auth::{CreateIdentityRequest, IdentityStore, IdentityType};
+use dnadb_engine::overlay::{OverlayAccess, OverlayDefinition, OverlayMutation, OverlayRegistry, ResolvedOverlay};
+use dnadb_engine::privacy::{mask_records_for_overlay, PrivacyError};
 use clap::Parser;
 use dnadb_engine::runtime::EngineRuntime;
 use dnadb_engine::transaction_durable::ExecutionResult;
 use dnadb_engine::wire::{MongoCommand, MongoFindCommand, MongoInsertOneCommand};
 use serde_json::{json, Map, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
+use tracing::{info, warn};
+
+const LATENCY_BUCKETS_MS: [u64; 9] = [1, 5, 10, 25, 50, 100, 250, 500, 1000];
 
 #[derive(Parser, Debug)]
 #[command(name = "dnadb_http")]
@@ -43,37 +48,168 @@ struct Args {
     #[arg(long)]
     static_dir: Option<PathBuf>,
 
-    /// If set, periodically run `materialize_raw_journal_to_durable` for these collections (comma-separated names).
-    /// Use with `--raw-materialize-interval-ms`.
-    #[arg(long, value_delimiter = ',')]
-    raw_materialize_collections: Vec<String>,
+    /// Require bearer auth for API routes.
+    #[arg(long, default_value_t = false)]
+    auth_required: bool,
 
-    /// Wall-clock interval (ms) for background materialization when `raw_materialize_collections` is non-empty.
+    /// Bootstrap admin API key identity (`name=admin`, overlay=full).
     #[arg(long)]
-    raw_materialize_interval_ms: Option<u64>,
+    admin_api_key: Option<String>,
 
-    /// Batch size for each background materialize tick; omit for adaptive (lag-based), or set `DNADB_RAW_MATERIALIZE_BATCH`.
+    /// Bootstrap redacted API key identity (`name=redacted-user`, overlay=redacted).
     #[arg(long)]
-    raw_materialize_batch: Option<usize>,
+    redacted_api_key: Option<String>,
+
+    /// Pre-warm sort index pages before accepting traffic.
+    #[arg(long, default_value_t = true)]
+    prewarm_indexes: bool,
+
+    /// Max in-flight HTTP requests before returning 503.
+    #[arg(long, default_value_t = 256)]
+    max_connections: usize,
 }
 
 #[derive(Clone)]
 struct AppState {
     rt: std::sync::Arc<Mutex<EngineRuntime>>,
+    auth_required: bool,
+    auth: std::sync::Arc<Mutex<IdentityStore>>,
+    overlays: std::sync::Arc<OverlayRegistry>,
+    metrics: std::sync::Arc<HttpMetrics>,
+    request_slots: std::sync::Arc<Semaphore>,
+    slow_query_ms: u64,
+}
+
+#[derive(Default)]
+struct HttpMetrics {
+    requests_total: AtomicU64,
+    errors_total: AtomicU64,
+    overload_rejections_total: AtomicU64,
+    inflight_requests: AtomicU64,
+    request_duration_ms_total: AtomicU64,
+    request_duration_count: AtomicU64,
+    slow_queries_total: AtomicU64,
+    latency_bucket_counts: [AtomicU64; LATENCY_BUCKETS_MS.len()],
+}
+
+impl HttpMetrics {
+    fn observe_request(&self, status: StatusCode, elapsed: Duration) {
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+        if status.as_u16() >= 500 {
+            self.errors_total.fetch_add(1, Ordering::Relaxed);
+        }
+        let elapsed_ms_u64 = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.request_duration_ms_total
+            .fetch_add(elapsed_ms_u64, Ordering::Relaxed);
+        self.request_duration_count.fetch_add(1, Ordering::Relaxed);
+        for (idx, bucket) in LATENCY_BUCKETS_MS.iter().enumerate() {
+            if elapsed_ms_u64 <= *bucket {
+                self.latency_bucket_counts[idx].fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "dnadb_http=info".to_string()),
+        )
+        .with_target(false)
+        .compact()
+        .init();
     let args = Args::parse();
     std::fs::create_dir_all(&args.data_dir)?;
+    let slow_query_ms = std::env::var("DNADB_SLOW_QUERY_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(25);
+    let max_connections = std::env::var("DNADB_HTTP_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(args.max_connections.max(1));
 
     let rt = EngineRuntime::open(args.data_dir.as_path(), args.mmap_bytes);
+    let mut auth_store = IdentityStore::new();
+    let mut overlays = OverlayRegistry::new();
+    overlays.define_overlay(OverlayDefinition::full("full"));
+    overlays.define_overlay(OverlayDefinition {
+        name: "redacted".to_string(),
+        access: OverlayAccess::Partial,
+        collections: vec!["posts".to_string()],
+        include_fields: {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "posts".to_string(),
+                vec!["id".to_string(), "title".to_string(), "status".to_string()],
+            );
+            m
+        },
+        exclude_fields: {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "posts".to_string(),
+                vec!["body".to_string(), "slug".to_string(), "author_email".to_string()],
+            );
+            m
+        },
+        mutations: vec![OverlayMutation::Read],
+        extends: None,
+        additionally_include: std::collections::HashMap::new(),
+    });
+    if let Some(api_key) = args
+        .admin_api_key
+        .or_else(|| std::env::var("DNADB_ADMIN_API_KEY").ok())
+    {
+        let _ = auth_store.create_identity(CreateIdentityRequest {
+            name: "admin".to_string(),
+            identity_type: IdentityType::Admin,
+            overlay: "full".to_string(),
+            allowed_collections: vec!["*".to_string()],
+            token_expiry_seconds: 86_400,
+            mfa_required: false,
+            password: None,
+            api_key: Some(api_key.clone()),
+        });
+        if let Ok(token) = auth_store.authenticate_with_api_key("admin", &api_key) {
+            info!(token = %token.token, "dnadb_http auth bootstrap admin");
+        }
+    }
+    if let Some(api_key) = args
+        .redacted_api_key
+        .or_else(|| std::env::var("DNADB_REDACTED_API_KEY").ok())
+    {
+        let _ = auth_store.create_identity(CreateIdentityRequest {
+            name: "redacted-user".to_string(),
+            identity_type: IdentityType::ReadOnly,
+            overlay: "redacted".to_string(),
+            allowed_collections: vec!["posts".to_string()],
+            token_expiry_seconds: 86_400,
+            mfa_required: false,
+            password: None,
+            api_key: Some(api_key.clone()),
+        });
+        if let Ok(token) = auth_store.authenticate_with_api_key("redacted-user", &api_key) {
+            info!(token = %token.token, "dnadb_http auth bootstrap redacted-user");
+        }
+    }
+
     let state = AppState {
         rt: std::sync::Arc::new(Mutex::new(rt)),
+        auth_required: args.auth_required || std::env::var("DNADB_AUTH_REQUIRED").ok().as_deref() == Some("1"),
+        auth: std::sync::Arc::new(Mutex::new(auth_store)),
+        overlays: std::sync::Arc::new(overlays),
+        metrics: std::sync::Arc::new(HttpMetrics::default()),
+        request_slots: std::sync::Arc::new(Semaphore::new(max_connections)),
+        slow_query_ms,
     };
 
     let api = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route(
             "/collections/:collection/sort-indexes",
             get(get_sort_indexes).post(configure_sort_indexes),
@@ -99,22 +235,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(rebuild_indexes),
         )
         .route(
+            "/collections/:collection/configure",
+            post(configure_collection),
+        )
+        .route(
             "/collections/:collection/storage/sync",
             post(sync_collection_storage),
-        )
-        .route(
-            "/collections/:collection/raw-materialize",
-            post(raw_materialize),
-        )
-        .route(
-            "/collections/:collection/raw-materialize/status",
-            get(raw_materialize_status),
         )
         .route(
             "/collections/:collection/documents",
             post(insert_one),
         )
         .route("/collections/:collection/query", post(query_find))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_concurrency_middleware,
+        ))
         .with_state(state.clone());
 
     let mut app = Router::new().nest("/api", api);
@@ -125,7 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ServeDir::new(dir).append_index_html_on_directories(true),
             );
         } else {
-            eprintln!(
+            warn!(
                 "warning: --static-dir {:?} is not a directory; skipping static hosting",
                 dir
             );
@@ -139,117 +275,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .allow_headers(Any),
     );
 
-    if args.raw_materialize_interval_ms.is_some() && args.raw_materialize_collections.is_empty() {
-        eprintln!(
-            "warning: --raw-materialize-interval-ms set without --raw-materialize-collections; skipping background materializer"
-        );
-    } else if !args.raw_materialize_collections.is_empty() {
-        let state_bg = state.clone();
-        let interval_ms = args
-            .raw_materialize_interval_ms
-            .or_else(|| {
-                std::env::var("DNADB_RAW_MATERIALIZE_INTERVAL_MS")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .unwrap_or(10)
-            .max(1);
-            let batch = args
-                .raw_materialize_batch
-                .or_else(|| {
-                    std::env::var("DNADB_RAW_MATERIALIZE_BATCH")
-                        .ok()
-                        .and_then(|s| s.parse::<usize>().ok())
-                })
-                .unwrap_or(512)
-                .max(1);
-            let max_batches_per_tick = std::env::var("DNADB_RAW_MATERIALIZE_MAX_BATCHES_PER_TICK")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(4)
-                .max(1);
-            let idle_ms = std::env::var("DNADB_RAW_MATERIALIZE_IDLE_MS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(2_000)
-                .max(1);
-            let collections: Vec<String> = args
-                .raw_materialize_collections
-                .iter()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            eprintln!(
-                "background materialize: collections={collections:?} active={interval_ms}ms idle={idle_ms}ms batch={batch} max_batches_per_tick={max_batches_per_tick}"
-            );
-        tokio::spawn(async move {
-            loop {
-                    let mut max_lag = 0u64;
-                    for c in &collections {
-                        let mut applied_total = 0usize;
-                        let mut last_applied = None::<u64>;
-                        for _ in 0..max_batches_per_tick {
-                            let apply = {
-                                let mut rt = state_bg.rt.lock().await;
-                                rt.materialize_raw_journal_apply_only_bounded(c, batch, 1)
-                            };
-                            match apply {
-                                Ok(r) => {
-                                    if r.records_applied == 0 {
-                                        break;
-                                    }
-                                    applied_total = applied_total.saturating_add(r.records_applied);
-                                    last_applied = Some(r.last_applied_wal_sequence);
-                            }
-                                Err(e) => {
-                                    eprintln!("raw_materialize apply error: collection={c} {e}");
-                                    break;
-                                }
-                            }
-                        }
-                        if applied_total > 0 {
-                            if let Ok(mut rt) = state_bg.rt.try_lock() {
-                                if let Err(e) = rt.sync_collection_storage(c) {
-                                    eprintln!("raw_materialize sync error: collection={c} {e}");
-                                }
-                            }
-                            eprintln!(
-                                "raw_materialize: collection={c} applied={applied_total} through_seq={}",
-                                last_applied.unwrap_or(0)
-                            );
-                        }
-                        let lag = {
-                            let mut rt = state_bg.rt.lock().await;
-                            rt.raw_journal_pending_sequences(c).unwrap_or(0)
-                        };
-                        max_lag = max_lag.max(lag);
-                    }
-                    let target = std::env::var("DNADB_RAW_TARGET_PENDING_SEQUENCES")
-                        .ok()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .filter(|&n| n > 0);
-                    let mut sleep_ms = if max_lag == 0 {
-                        idle_ms
-                    } else {
-                        interval_ms
-                    };
-                    if let Some(t) = target {
-                        if max_lag > t {
-                            sleep_ms = (interval_ms / 4).max(10);
-                        }
-                    }
-                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-            }
-        });
+    if args.prewarm_indexes {
+        prewarm_sort_indexes(&state).await;
     }
 
-    let listener = tokio::net::TcpListener::bind(&args.bind).await?;
-    eprintln!(
-        "dnadb_http listening on http://{}  (data_dir={})",
-        args.bind,
-        args.data_dir.display()
-    );
-    axum::serve(listener, app).await?;
+    if let (Ok(cert), Ok(key)) = (std::env::var("DNADB_TLS_CERT"), std::env::var("DNADB_TLS_KEY")) {
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert.clone(), key.clone()).await?;
+        info!(
+            "dnadb_http listening on https://{}  (data_dir={}, tls_cert={cert}, tls_key={key})",
+            args.bind,
+            args.data_dir.display()
+        );
+        axum_server::bind_rustls(args.bind.parse()?, tls)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(&args.bind).await?;
+        info!(
+            "dnadb_http listening on http://{}  (data_dir={})",
+            args.bind,
+            args.data_dir.display()
+        );
+        axum::serve(listener, app).await?;
+    }
     Ok(())
 }
 
@@ -257,15 +305,113 @@ async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "service": "dnadb_http" }))
 }
 
+async fn metrics(State(state): State<AppState>) -> Response {
+    let m = &state.metrics;
+    let mut out = String::new();
+    out.push_str("# TYPE dnadb_http_requests_total counter\n");
+    out.push_str(&format!(
+        "dnadb_http_requests_total {}\n",
+        m.requests_total.load(Ordering::Relaxed)
+    ));
+    out.push_str("# TYPE dnadb_http_errors_total counter\n");
+    out.push_str(&format!(
+        "dnadb_http_errors_total {}\n",
+        m.errors_total.load(Ordering::Relaxed)
+    ));
+    out.push_str("# TYPE dnadb_http_overload_rejections_total counter\n");
+    out.push_str(&format!(
+        "dnadb_http_overload_rejections_total {}\n",
+        m.overload_rejections_total.load(Ordering::Relaxed)
+    ));
+    out.push_str("# TYPE dnadb_http_inflight_requests gauge\n");
+    let inflight = m.inflight_requests.load(Ordering::Relaxed).saturating_sub(1);
+    out.push_str(&format!("dnadb_http_inflight_requests {}\n", inflight));
+    out.push_str("# TYPE dnadb_http_slow_queries_total counter\n");
+    out.push_str(&format!(
+        "dnadb_http_slow_queries_total {}\n",
+        m.slow_queries_total.load(Ordering::Relaxed)
+    ));
+    out.push_str("# TYPE dnadb_http_request_duration_ms_total counter\n");
+    out.push_str(&format!(
+        "dnadb_http_request_duration_ms_total {}\n",
+        m.request_duration_ms_total.load(Ordering::Relaxed)
+    ));
+    out.push_str("# TYPE dnadb_http_request_duration_count counter\n");
+    out.push_str(&format!(
+        "dnadb_http_request_duration_count {}\n",
+        m.request_duration_count.load(Ordering::Relaxed)
+    ));
+    out.push_str("# TYPE dnadb_http_request_duration_ms_bucket counter\n");
+    let mut running = 0u64;
+    for (idx, bucket) in LATENCY_BUCKETS_MS.iter().enumerate() {
+        running = running.saturating_add(m.latency_bucket_counts[idx].load(Ordering::Relaxed));
+        out.push_str(&format!(
+            "dnadb_http_request_duration_ms_bucket{{le=\"{}\"}} {}\n",
+            bucket, running
+        ));
+    }
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        out,
+    )
+        .into_response()
+}
+
+async fn request_concurrency_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let start = Instant::now();
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let permit = match state.request_slots.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            state
+                .metrics
+                .overload_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .observe_request(StatusCode::SERVICE_UNAVAILABLE, Duration::from_millis(0));
+            warn!(method = %method, path = %path, "http overload rejection");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "error": "server overloaded; retry later"})),
+            )
+                .into_response();
+        }
+    };
+    state.metrics.inflight_requests.fetch_add(1, Ordering::Relaxed);
+    let resp = next.run(req).await;
+    let status = resp.status();
+    let elapsed = start.elapsed();
+    state.metrics.observe_request(status, elapsed);
+    state.metrics.inflight_requests.fetch_sub(1, Ordering::Relaxed);
+    drop(permit);
+    info!(
+        method = %method,
+        path = %path,
+        status = status.as_u16(),
+        elapsed_ms = elapsed.as_millis() as u64,
+        "http request"
+    );
+    resp
+}
+
 async fn insert_one(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(collection): AxumPath<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    let _ = resolve_overlay(&state, &headers).await?;
     let t0 = Instant::now();
     let mut rt = state.rt.lock().await;
     let cmd = MongoCommand::InsertOne(MongoInsertOneCommand {
-        collection,
+        collection: collection.clone(),
         document: body,
     });
     let out = rt.execute_mongo_command(cmd).map_err(ApiError::runtime)?;
@@ -289,15 +435,6 @@ enum DurabilityMode {
     Deferred,
 }
 
-/// Which write engine handles the batch. `durable` = MVCC + strands; `raw_segment` = append-only journal (no query yet).
-#[derive(Default, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-enum BulkWritePath {
-    #[default]
-    Durable,
-    RawSegment,
-}
-
 #[derive(serde::Deserialize)]
 struct BulkBody {
     documents: Vec<Value>,
@@ -309,13 +446,6 @@ struct BulkBody {
     /// Prefer this over inferring from `defer_reindex` / `defer_storage_fsync`.
     #[serde(default)]
     durability: Option<DurabilityMode>,
-    #[serde(default)]
-    write_path: BulkWritePath,
-    /// After `write_path: raw_segment`, run WAL→durable materialization before responding (dev convenience).
-    #[serde(default)]
-    auto_materialize: bool,
-    #[serde(default)]
-    materialize_batch_size: Option<usize>,
 }
 
 fn resolve_bulk_strand_durability(body: &BulkBody) -> (bool, DurabilityMode) {
@@ -336,9 +466,11 @@ fn resolve_bulk_strand_durability(body: &BulkBody) -> (bool, DurabilityMode) {
 
 async fn bulk_insert(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(collection): AxumPath<String>,
     Json(body): Json<BulkBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let _ = resolve_overlay(&state, &headers).await?;
     let max_batch = std::env::var("DNADB_HTTP_MAX_BULK")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -350,49 +482,6 @@ async fn bulk_insert(
         )));
     }
     let batch_size = body.documents.len();
-
-    if matches!(body.write_path, BulkWritePath::RawSegment) {
-        let mat_batch = body
-            .materialize_batch_size
-            .or_else(|| {
-                std::env::var("DNADB_RAW_MATERIALIZE_BATCH")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-            })
-            .unwrap_or(0);
-        let t0 = Instant::now();
-        let mut rt = state.rt.lock().await;
-        let affected = rt
-            .execute_raw_segment_bulk_insert(&collection, body.documents)
-            .map_err(ApiError::runtime)?;
-        let materialize = if body.auto_materialize {
-            Some(
-                rt.materialize_raw_journal_to_durable(&collection, mat_batch)
-                    .map_err(ApiError::runtime)?,
-            )
-        } else {
-            None
-        };
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let mvcc_ok = materialize.as_ref().map_or(false, |m| {
-            m.raw_wal_high_water_sequence <= m.last_applied_wal_sequence
-        });
-        return Ok(Json(json!({
-            "ok": true,
-            "affected": affected,
-            "ms": ms,
-            "batch_size": batch_size,
-            "write_path": "raw_segment",
-            "mvcc_queryable": mvcc_ok,
-            "auto_materialize": body.auto_materialize,
-            "materialize": materialize,
-            "note": if materialize.is_some() {
-                "Raw ingest + materialize; rows are in the durable store — overlays apply on query."
-            } else {
-                "Stored under data_dir/raw_journal/<collection>/ only; POST /api/.../raw-materialize or auto_materialize:true for MVCC visibility."
-            },
-        })));
-    }
 
     let (defer_storage_fsync, durability_mode) = resolve_bulk_strand_durability(&body);
     let t0 = Instant::now();
@@ -437,92 +526,6 @@ async fn bulk_insert(
     ))
 }
 
-#[derive(serde::Deserialize)]
-struct RawMaterializeBody {
-    #[serde(default)]
-    batch_size: Option<usize>,
-}
-
-async fn raw_materialize(
-    State(state): State<AppState>,
-    AxumPath(collection): AxumPath<String>,
-    body: Option<Json<RawMaterializeBody>>,
-) -> Result<Json<Value>, ApiError> {
-    let batch_size = body
-        .and_then(|Json(b)| b.batch_size)
-        .or_else(|| {
-            std::env::var("DNADB_RAW_MATERIALIZE_BATCH")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-        })
-        .unwrap_or(0);
-    let t0 = Instant::now();
-    let mut rt = state.rt.lock().await;
-    let r = rt
-        .materialize_raw_journal_to_durable(&collection, batch_size)
-        .map_err(ApiError::runtime)?;
-    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    Ok(Json(json!({
-        "ok": true,
-        "collection": collection,
-        "ms": ms,
-        "records_applied": r.records_applied,
-        "last_applied_wal_sequence": r.last_applied_wal_sequence,
-        "batches": r.batches,
-        "raw_wal_high_water_sequence": r.raw_wal_high_water_sequence,
-        "adaptive_batch": r.adaptive_batch,
-        "materialization_records_per_sec": r.materialization_records_per_sec,
-        "note": "WAL-ordered upserts into the durable store; query is now consistent for materialized keys (overlays still apply on read)."
-    })))
-}
-
-async fn raw_materialize_status(
-    State(state): State<AppState>,
-    AxumPath(collection): AxumPath<String>,
-) -> Result<Json<Value>, ApiError> {
-    let mut rt = state.rt.lock().await;
-    let (st, hw) = rt
-        .raw_journal_materialization_status(&collection)
-        .map_err(ApiError::runtime)?;
-    let pending = hw.saturating_sub(st.last_applied_wal_sequence);
-    let suggested_batch = rt
-        .adaptive_materialize_batch_preview(&collection)
-        .map_err(ApiError::runtime)?;
-    let mat_rps_from_state = match (st.last_materialize_records, st.last_materialize_duration_ms) {
-        (Some(n), Some(dms)) if dms > 0 => Some((n as f64) / (dms as f64 / 1000.0)),
-        _ => None,
-    };
-    let lag_sec_est = mat_rps_from_state
-        .filter(|&r| r > 0.0)
-        .map(|r| pending as f64 / r);
-    let ingest_total = rt.raw_ingest_total_documents(&collection);
-    let ingest_rps = rt.raw_ingest_documents_per_sec_estimate(&collection);
-    let target_pending = std::env::var("DNADB_RAW_TARGET_PENDING_SEQUENCES")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok());
-    let target_lag_ms = std::env::var("DNADB_RAW_TARGET_LAG_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok());
-    Ok(Json(
-        json!({
-            "ok": true,
-            "collection": collection,
-            "last_applied_wal_sequence": st.last_applied_wal_sequence,
-            "raw_wal_high_water_sequence": hw,
-            "pending_wal_sequences": pending,
-            "suggested_materialize_batch_records": suggested_batch,
-            "materialization_records_per_sec_last_run": mat_rps_from_state,
-            "lag_seconds_estimate": lag_sec_est,
-            "raw_ingest_total_documents": ingest_total,
-            "ingest_documents_per_sec_estimate": ingest_rps,
-            "env": {
-                "DNADB_RAW_TARGET_PENDING_SEQUENCES": target_pending,
-                "DNADB_RAW_TARGET_LAG_MS": target_lag_ms,
-            }
-        }),
-    ))
-}
-
 async fn sync_collection_storage(
     State(state): State<AppState>,
     AxumPath(collection): AxumPath<String>,
@@ -556,13 +559,18 @@ struct QueryBody {
 
 async fn query_find(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(collection): AxumPath<String>,
     Json(body): Json<QueryBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let filter = body.filter.clone();
+    let sort = body.sort.clone();
+    let limit = body.limit;
+    let overlay = resolve_overlay(&state, &headers).await?;
     let t0 = Instant::now();
     let mut rt = state.rt.lock().await;
     let cmd = MongoCommand::Find(MongoFindCommand {
-        collection,
+        collection: collection.clone(),
         filter: body.filter,
         sort: body.sort,
         limit: body.limit,
@@ -570,12 +578,29 @@ async fn query_find(
     });
     let out = rt.execute_mongo_command(cmd).map_err(ApiError::runtime)?;
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if ms > state.slow_query_ms as f64 {
+        state
+            .metrics
+            .slow_queries_total
+            .fetch_add(1, Ordering::Relaxed);
+        let filter_json = Value::Object(filter.clone()).to_string();
+        warn!(
+            collection = %collection,
+            duration_ms = ms,
+            filter = %filter_json,
+            sort = ?sort,
+            limit = ?limit,
+            "slow query"
+        );
+    }
     match out {
         ExecutionResult::QueryRows(rows) => {
-            let rows: Vec<Value> = rows
-                .into_iter()
-                .map(|m| Value::Object(m.into_iter().collect()))
-                .collect();
+            let rows = if let Some(ov) = overlay.as_ref() {
+                mask_records_for_overlay(&collection, &rows, ov).map_err(ApiError::privacy)?
+            } else {
+                rows
+            };
+            let rows: Vec<Value> = rows.into_iter().map(|m| Value::Object(m.into_iter().collect())).collect();
             let count = rows.len();
             Ok(Json(
                 json!({ "ok": true, "rows": rows, "count": count, "ms": ms }),
@@ -589,6 +614,18 @@ async fn query_find(
 struct SortIndexConfigBody {
     #[serde(default)]
     sort_indexes: Vec<SortIndexSpec>,
+    #[serde(default)]
+    composite_sort_indexes: Vec<CompositeSortIndexSpec>,
+    /// If set (including empty `[]`), replaces exact-string index fields for this collection.
+    /// If omitted, exact-string fields are left unchanged.
+    #[serde(default)]
+    exact_string_fields: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct CollectionConfigureBody {
+    #[serde(default)]
+    sort_indexes: Vec<String>,
     #[serde(default)]
     composite_sort_indexes: Vec<CompositeSortIndexSpec>,
     /// If set (including empty `[]`), replaces exact-string index fields for this collection.
@@ -717,6 +754,64 @@ async fn configure_sort_indexes(
     ))
 }
 
+async fn configure_collection(
+    State(state): State<AppState>,
+    AxumPath(collection): AxumPath<String>,
+    Json(body): Json<CollectionConfigureBody>,
+) -> Result<Json<Value>, ApiError> {
+    let fields: Vec<String> = body
+        .sort_indexes
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let composite_defs: Vec<(String, String)> = body
+        .composite_sort_indexes
+        .into_iter()
+        .filter_map(|spec| {
+            if spec.fields.len() != 2 {
+                return None;
+            }
+            let a = spec.fields[0].trim().to_string();
+            let b = spec.fields[1].trim().to_string();
+            if a.is_empty() || b.is_empty() {
+                None
+            } else {
+                Some((a, b))
+            }
+        })
+        .collect();
+
+    let mut rt = state.rt.lock().await;
+    let active = rt
+        .configure_sort_indexes(&collection, &fields)
+        .map_err(ApiError::runtime)?;
+    let composites = rt
+        .configure_composite_sort_indexes(&collection, &composite_defs)
+        .map_err(ApiError::runtime)?;
+    let exact_string_fields = if let Some(ref ef) = body.exact_string_fields {
+        rt.configure_exact_string_index_fields(&collection, ef)
+            .map_err(ApiError::runtime)?
+    } else {
+        rt.exact_string_index_fields(&collection)
+            .map_err(ApiError::runtime)?
+    };
+    let composites_json: Vec<Value> = composites
+        .into_iter()
+        .map(|(a, b)| json!({ "fields": [a, b] }))
+        .collect();
+    Ok(Json(
+        json!({
+            "ok": true,
+            "collection": collection,
+            "sort_indexes": active,
+            "composite_sort_indexes": composites_json,
+            "exact_string_fields": exact_string_fields,
+            "configured": true
+        }),
+    ))
+}
+
 async fn add_sort_index(
     State(state): State<AppState>,
     AxumPath(collection): AxumPath<String>,
@@ -769,6 +864,7 @@ async fn configure_composite_sort_indexes(
     ))
 }
 
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     message: String,
@@ -783,18 +879,22 @@ impl ApiError {
     }
 
     fn runtime(e: dnadb_engine::runtime::RuntimeError) -> Self {
-        let status = match &e {
-            dnadb_engine::runtime::RuntimeError::RawSegment(_) => StatusCode::BAD_REQUEST,
-            dnadb_engine::runtime::RuntimeError::RawIngestCriticalLag { .. } => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
-            dnadb_engine::runtime::RuntimeError::RawIngestBackpressure { .. } => {
-                StatusCode::TOO_MANY_REQUESTS
-            }
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
         Self {
-            status,
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: e.to_string(),
+        }
+    }
+
+    fn unauthorized(message: String) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message,
+        }
+    }
+
+    fn privacy(e: PrivacyError) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
             message: e.to_string(),
         }
     }
@@ -804,5 +904,241 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = Json(json!({ "ok": false, "error": self.message }));
         (self.status, body).into_response()
+    }
+}
+
+async fn resolve_overlay(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<ResolvedOverlay>, ApiError> {
+    if !state.auth_required {
+        return Ok(None);
+    }
+    let authz = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::unauthorized("unauthorized".to_string()))?;
+    let token = authz
+        .strip_prefix("Bearer ")
+        .or_else(|| authz.strip_prefix("bearer "))
+        .ok_or_else(|| ApiError::unauthorized("unauthorized".to_string()))?;
+    let auth = state.auth.lock().await;
+    let (.., overlay) = state
+        .overlays
+        .resolve_for_session(&auth, token)
+        .map_err(|_| ApiError::unauthorized("unauthorized".to_string()))?;
+    Ok(Some(overlay))
+}
+
+async fn prewarm_sort_indexes(state: &AppState) {
+    let collections = {
+        let rt = state.rt.lock().await;
+        rt.list_known_collections()
+    };
+    if collections.is_empty() {
+        info!("dnadb_http prewarm: no collections found");
+        return;
+    }
+    let mut warmed = 0usize;
+    for collection in collections {
+        let fields = {
+            let mut rt = state.rt.lock().await;
+            rt.sort_index_fields(&collection).unwrap_or_default()
+        };
+        if fields.is_empty() {
+            continue;
+        }
+        for field in fields {
+            let mut sort = Map::new();
+            sort.insert(field.clone(), json!(-1));
+            let cmd = MongoCommand::Find(MongoFindCommand {
+                collection: collection.clone(),
+                filter: Map::new(),
+                sort: Some(sort),
+                limit: Some(50),
+                include_paths: vec![],
+            });
+            let _ = {
+                let mut rt = state.rt.lock().await;
+                rt.execute_mongo_command(cmd)
+            };
+            warmed = warmed.saturating_add(1);
+            info!("dnadb_http prewarm: touched {collection}.{field}");
+        }
+    }
+    info!("dnadb_http prewarm: completed {warmed} index probes");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn make_test_state(auth_required: bool) -> (AppState, String, String) {
+        let dir = tempdir().expect("tempdir").keep();
+        let rt = EngineRuntime::open(dir.as_path(), Some(1024 * 1024));
+        let mut auth_store = IdentityStore::new();
+        let mut overlays = OverlayRegistry::new();
+        overlays.define_overlay(OverlayDefinition::full("full"));
+        overlays.define_overlay(OverlayDefinition {
+            name: "redacted".to_string(),
+            access: OverlayAccess::Partial,
+            collections: vec!["posts".to_string()],
+            include_fields: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "posts".to_string(),
+                    vec!["id".to_string(), "title".to_string(), "status".to_string()],
+                );
+                m
+            },
+            exclude_fields: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "posts".to_string(),
+                    vec!["body".to_string(), "slug".to_string(), "author_email".to_string()],
+                );
+                m
+            },
+            mutations: vec![OverlayMutation::Read],
+            extends: None,
+            additionally_include: std::collections::HashMap::new(),
+        });
+        auth_store
+            .create_identity(CreateIdentityRequest {
+                name: "admin".to_string(),
+                identity_type: IdentityType::Admin,
+                overlay: "full".to_string(),
+                allowed_collections: vec!["*".to_string()],
+                token_expiry_seconds: 86_400,
+                mfa_required: false,
+                password: None,
+                api_key: Some("admin-key".to_string()),
+            })
+            .expect("admin id");
+        auth_store
+            .create_identity(CreateIdentityRequest {
+                name: "redacted-user".to_string(),
+                identity_type: IdentityType::ReadOnly,
+                overlay: "redacted".to_string(),
+                allowed_collections: vec!["posts".to_string()],
+                token_expiry_seconds: 86_400,
+                mfa_required: false,
+                password: None,
+                api_key: Some("redacted-key".to_string()),
+            })
+            .expect("redacted id");
+        let admin_token = auth_store
+            .authenticate_with_api_key("admin", "admin-key")
+            .expect("admin token")
+            .token;
+        let redacted_token = auth_store
+            .authenticate_with_api_key("redacted-user", "redacted-key")
+            .expect("redacted token")
+            .token;
+        (
+            AppState {
+                rt: std::sync::Arc::new(Mutex::new(rt)),
+                auth_required,
+                auth: std::sync::Arc::new(Mutex::new(auth_store)),
+                overlays: std::sync::Arc::new(overlays),
+            },
+            admin_token,
+            redacted_token,
+        )
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_request_rejected() {
+        let (state, _, _) = make_test_state(true);
+        let headers = HeaderMap::new();
+        let result = query_find(
+            State(state),
+            headers,
+            AxumPath("posts".to_string()),
+            Json(QueryBody {
+                filter: Map::new(),
+                limit: Some(1),
+                sort: None,
+            }),
+        )
+        .await;
+        let err = result.expect_err("must reject");
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn overlay_strips_excluded_fields_through_http() {
+        let (state, admin_token, redacted_token) = make_test_state(true);
+        {
+            let mut rt = state.rt.lock().await;
+            let _ = rt
+                .execute_mongo_insert_many(
+                    "posts",
+                    vec![json!({
+                        "id": 1,
+                        "title": "Test",
+                        "status": "published",
+                        "body": "full body text",
+                        "slug": "post-1",
+                        "author_email": "private@example.com"
+                    })],
+                )
+                .expect("insert");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {redacted_token}").parse().expect("header"),
+        );
+        let redacted = query_find(
+            State(state.clone()),
+            headers,
+            AxumPath("posts".to_string()),
+            Json(QueryBody {
+                filter: Map::new(),
+                limit: Some(1),
+                sort: None,
+            }),
+        )
+        .await
+        .expect("redacted query");
+        let rows = redacted
+            .0
+            .get("rows")
+            .and_then(|v| v.as_array())
+            .expect("rows");
+        let row = rows.first().and_then(|v| v.as_object()).expect("row");
+        assert_eq!(row.get("id"), Some(&json!(1)));
+        assert_eq!(row.get("title"), Some(&json!("Test")));
+        assert!(!row.contains_key("body"));
+        assert!(!row.contains_key("author_email"));
+
+        let mut admin_headers = HeaderMap::new();
+        admin_headers.insert(
+            "authorization",
+            format!("Bearer {admin_token}").parse().expect("header"),
+        );
+        let full = query_find(
+            State(state),
+            admin_headers,
+            AxumPath("posts".to_string()),
+            Json(QueryBody {
+                filter: Map::new(),
+                limit: Some(1),
+                sort: None,
+            }),
+        )
+        .await
+        .expect("admin query");
+        let full_rows = full
+            .0
+            .get("rows")
+            .and_then(|v| v.as_array())
+            .expect("rows");
+        let full_row = full_rows.first().and_then(|v| v.as_object()).expect("row");
+        assert!(full_row.get("body").and_then(|v| v.as_str()).is_some());
+        assert!(full_row.get("author_email").and_then(|v| v.as_str()).is_some());
     }
 }

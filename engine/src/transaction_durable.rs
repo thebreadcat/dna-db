@@ -1,6 +1,7 @@
 //! Durable transaction runtime: MVCC transaction manager + WAL/materialization integration.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -66,9 +67,9 @@ pub struct DurableTransactionStore {
     /// Record ids to ignore in `sort_index_sealed` for this field (updates/deletes after seal).
     sort_index_sealed_stale: HashMap<String, HashSet<u64>>,
     sort_index_values: HashMap<String, HashMap<u64, i64>>,
-    exact_string_indexes: HashMap<String, HashMap<String, HashSet<u64>>>,
+    exact_string_indexes: HashMap<String, BTreeMap<String, HashSet<u64>>>,
     exact_string_index_values: HashMap<u64, Vec<(String, String)>>,
-    text_trigram_indexes: HashMap<String, HashMap<String, HashSet<u64>>>,
+    text_trigram_indexes: HashMap<String, BTreeMap<String, HashSet<u64>>>,
     text_trigram_index_values: HashMap<u64, Vec<(String, Vec<String>)>>,
     composite_sort_indexes: HashMap<(String, String), HashMap<String, BTreeSet<SortIndexEntry>>>,
     composite_sort_index_values: HashMap<(String, String), HashMap<u64, (String, i64)>>,
@@ -112,7 +113,7 @@ struct SortIndexEntry {
     record_id: u64,
 }
 
-const DEFAULT_SORT_INDEX_FIELDS: [&str; 3] = ["updated_at", "created_at", "published_at"];
+const DEFAULT_SORT_INDEX_FIELDS: [&str; 4] = ["id", "updated_at", "created_at", "published_at"];
 const DEFAULT_EXACT_STRING_INDEX_FIELDS: [&str; 3] = ["slug", "title", "email"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -713,53 +714,6 @@ impl DurableTransactionStore {
         Ok(ExecutionResult::AffectedRows(affected))
     }
 
-    /// Materializer fast-path: decode/apply into MVCC + indexes directly.
-    /// Intentionally skips WAL/storage write path because records already exist in raw journal.
-    pub fn execute_insert_many_materialize_direct(
-        &mut self,
-        records: Vec<Value>,
-    ) -> Result<ExecutionResult, DurableTxnError> {
-        if records.is_empty() {
-            return Ok(ExecutionResult::AffectedRows(0));
-        }
-        let mat_phases = env::var_os("DNADB_MAT_PHASES_PROFILE").is_some();
-        let t_start = Instant::now();
-        let affected = records.len();
-        let mut tx = self.begin();
-        let mut existed_before: Vec<bool> = Vec::with_capacity(affected);
-        let t_exist = Instant::now();
-        for record in records {
-            let row = json_object_to_record(record)?;
-            let id = record_id_from_record(&row).ok_or(DurableTxnError::Transaction(
-                "record must contain numeric `id` field",
-            ))?;
-            existed_before.push(self.tx_manager.contains_record_id(id));
-            self.upsert(&mut tx, id, row);
-        }
-        let exist_us = t_exist.elapsed().as_micros();
-        let t_txmgr = Instant::now();
-        self.tx_manager
-            .can_commit(&tx)
-            .map_err(DurableTxnError::Transaction)?;
-        let pending_writes = tx.write_set.clone();
-        self.tx_manager
-            .commit(&mut tx)
-            .map_err(DurableTxnError::Transaction)?;
-        let txmgr_us = t_txmgr.elapsed().as_micros();
-        let t_index = Instant::now();
-        self.apply_sort_index_writes_materialized(&pending_writes, &existed_before);
-        let index_us = t_index.elapsed().as_micros();
-        if mat_phases {
-            let total_us = t_start.elapsed().as_micros();
-            let per_rec_us = total_us as f64 / affected.max(1) as f64;
-            eprintln!(
-                "MAT_PHASES n={} total={}us exist={}us txmgr={}us index={}us per_rec_us={:.2}",
-                affected, total_us, exist_us, txmgr_us, index_us, per_rec_us
-            );
-        }
-        Ok(ExecutionResult::AffectedRows(affected))
-    }
-
     /// Full storage durability: mmap flush + `sync_data` on strand files. Clears any deferred fsync state.
     pub fn sync_storage_to_disk(&mut self) -> Result<(), DurableTxnError> {
         self.storage.flush()?;
@@ -899,29 +853,6 @@ impl DurableTransactionStore {
                 WriteOp::Upsert { record_id, record } => {
                     self.deindex_record(*record_id);
                     self.index_record_values(*record_id, record);
-                }
-                WriteOp::Delete { record_id } => {
-                    self.deindex_record(*record_id);
-                }
-            }
-        }
-    }
-
-    fn apply_sort_index_writes_materialized(
-        &mut self,
-        writes: &[WriteOp],
-        existed_before: &[bool],
-    ) {
-        let mut upsert_i = 0usize;
-        for op in writes {
-            match op {
-                WriteOp::Upsert { record_id, record } => {
-                    let existed = existed_before.get(upsert_i).copied().unwrap_or(true);
-                    if existed {
-                        self.deindex_record(*record_id);
-                    }
-                    self.index_record_values(*record_id, record);
-                    upsert_i = upsert_i.saturating_add(1);
                 }
                 WriteOp::Delete { record_id } => {
                     self.deindex_record(*record_id);
@@ -1216,14 +1147,74 @@ impl DurableTransactionStore {
             return None;
         }
         let field_map = self.exact_string_indexes.get(&w.field)?;
-        let mut ids: HashSet<u64> = HashSet::new();
-        for (key, idset) in field_map {
-            let Some(decoded) = string_value_from_exact_index_key(key) else {
-                continue;
-            };
-            if decoded.starts_with(prefix) {
-                ids.extend(idset.iter().copied());
+        let range_prefix = canonical_string_prefix_key(prefix)?;
+        let range_hi = prefix_upper_bound(&range_prefix);
+        let limit = ast.limit.map(|v| v as usize).unwrap_or(usize::MAX);
+        let order_by_id = ast
+            .order_by
+            .as_ref()
+            .filter(|o| o.field == "id")
+            .map(|o| o.direction);
+
+        // For `LIKE 'prefix%' ORDER BY id LIMIT N`, scanning the id-sort index and applying
+        // the predicate in-id-order lets us stop once LIMIT is reached. This avoids scanning
+        // every prefix-match candidate when the prefix fan-out is large (e.g. 1M-scale CMS).
+        if order_by_id.is_some()
+            && (self.sort_index_sealed.contains_key("id") || self.sort_index_active.contains_key("id"))
+        {
+            if let Some(rows) = self.sort_index_query_rows(txn, ast) {
+                return Some(rows);
             }
+        }
+
+        // Prefix+LIMIT hot path:
+        // - no ORDER BY: stop at LIMIT while scanning prefix key range
+        // - ORDER BY id: keep only top-LIMIT ids in a bounded heap, then materialize those rows
+        let mut ids = Vec::new();
+        if let Some(direction) = order_by_id {
+            match direction {
+                SortDirection::Asc => {
+                    let mut heap: BinaryHeap<u64> = BinaryHeap::new();
+                    with_prefix_idsets(field_map, &range_prefix, range_hi.as_deref(), |idset| {
+                        for id in idset {
+                            heap.push(*id);
+                            if heap.len() > limit {
+                                heap.pop();
+                            }
+                        }
+                        true
+                    });
+                    ids = heap.into_vec();
+                    ids.sort_unstable();
+                }
+                SortDirection::Desc => {
+                    let mut heap: BinaryHeap<Reverse<u64>> = BinaryHeap::new();
+                    with_prefix_idsets(field_map, &range_prefix, range_hi.as_deref(), |idset| {
+                        for id in idset {
+                            heap.push(Reverse(*id));
+                            if heap.len() > limit {
+                                heap.pop();
+                            }
+                        }
+                        true
+                    });
+                    ids = heap.into_iter().map(|v| v.0).collect();
+                    ids.sort_unstable_by(|a, b| b.cmp(a));
+                }
+            }
+        } else {
+            with_prefix_idsets(field_map, &range_prefix, range_hi.as_deref(), |idset| {
+                if ids.len() >= limit {
+                    return false;
+                }
+                for id in idset {
+                    ids.push(*id);
+                    if ids.len() >= limit {
+                        break;
+                    }
+                }
+                ids.len() < limit
+            });
         }
         let mut rows = Vec::new();
         for id in ids {
@@ -1383,6 +1374,16 @@ impl DurableTransactionStore {
         if ast.wheres.len() != 1 || !ast.includes.is_empty() {
             return None;
         }
+        if ast
+            .order_by
+            .as_ref()
+            .is_some_and(|o| o.field == "id")
+            && (self.sort_index_sealed.contains_key("id") || self.sort_index_active.contains_key("id"))
+        {
+            // Prefer id-sort scan for ORDER BY id prefix queries; it can early-stop at LIMIT
+            // without enumerating all prefix candidates.
+            return None;
+        }
         let w = ast.wheres.first()?;
         if w.op != WhereOp::Like {
             return None;
@@ -1395,13 +1396,19 @@ impl DurableTransactionStore {
             return None;
         }
         let field_map = self.exact_string_indexes.get(&w.field)?;
+        let range_prefix = canonical_string_prefix_key(prefix)?;
+        let range_hi = prefix_upper_bound(&range_prefix);
         let mut matched_rows = 0usize;
-        for (key, idset) in field_map {
-            let Some(decoded) = string_value_from_exact_index_key(key) else {
-                continue;
-            };
-            if decoded.starts_with(prefix) {
-                matched_rows = matched_rows.saturating_add(idset.len());
+        match range_hi {
+            Some(hi) => {
+                for (_, idset) in field_map.range(range_prefix..hi) {
+                    matched_rows = matched_rows.saturating_add(idset.len());
+                }
+            }
+            None => {
+                for (_, idset) in field_map.range(range_prefix..) {
+                    matched_rows = matched_rows.saturating_add(idset.len());
+                }
             }
         }
         if matched_rows == 0 {
@@ -1716,15 +1723,6 @@ fn canonical_literal_key(lit: &QueryLiteral) -> String {
     }
 }
 
-/// Decode a bucket key produced by [`canonical_value_key`] / JSON string serialization.
-fn string_value_from_exact_index_key(key: &str) -> Option<String> {
-    let v: Value = serde_json::from_str(key).ok()?;
-    match v {
-        Value::String(s) => Some(s),
-        _ => None,
-    }
-}
-
 fn literal_as_f64(lit: &QueryLiteral) -> Option<f64> {
     match lit {
         QueryLiteral::I64(v) => Some(*v as f64),
@@ -1774,7 +1772,7 @@ fn trigrams_for_text(value: &str) -> Vec<String> {
 }
 
 fn candidate_ids_for_contains(
-    postings: &HashMap<String, HashSet<u64>>,
+    postings: &BTreeMap<String, HashSet<u64>>,
     needle: &str,
 ) -> Option<Vec<u64>> {
     let grams = trigrams_for_text(needle);
@@ -1792,6 +1790,52 @@ fn candidate_ids_for_contains(
     let mut out: Vec<u64> = acc.unwrap_or_default().into_iter().collect();
     out.sort_unstable();
     Some(out)
+}
+
+fn canonical_string_prefix_key(prefix: &str) -> Option<String> {
+    let mut s = serde_json::to_string(prefix).ok()?;
+    if s.pop() != Some('"') {
+        return None;
+    }
+    Some(s)
+}
+
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] != 0xFF {
+            bytes[i] = bytes[i].saturating_add(1);
+            bytes.truncate(i + 1);
+            return String::from_utf8(bytes).ok();
+        }
+    }
+    None
+}
+
+fn with_prefix_idsets<F>(
+    field_map: &BTreeMap<String, HashSet<u64>>,
+    range_prefix: &str,
+    range_hi: Option<&str>,
+    mut f: F,
+) where
+    F: FnMut(&HashSet<u64>) -> bool,
+{
+    match range_hi {
+        Some(hi) => {
+            for (_, idset) in field_map.range(range_prefix.to_string()..hi.to_string()) {
+                if !f(idset) {
+                    break;
+                }
+            }
+        }
+        None => {
+            for (_, idset) in field_map.range(range_prefix.to_string()..) {
+                if !f(idset) {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn matches_record(record: &crate::mvcc::Record, ast: &QueryAst) -> bool {

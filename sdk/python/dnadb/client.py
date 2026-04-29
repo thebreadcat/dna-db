@@ -49,9 +49,28 @@ class InsertRequest(Generic[TRecord]):
     record: TRecord
 
 
+@dataclass(frozen=True)
+class ConfigureCollectionRequest:
+    collection: str
+    sort_indexes: list[str]
+    composite_sort_indexes: list[tuple[str, str]] = field(default_factory=list)
+    exact_string_fields: Optional[list[str]] = None
+
+
+@dataclass(frozen=True)
+class ConfigureCollectionResult:
+    collection: str
+    sort_indexes: list[str]
+    composite_sort_indexes: list[tuple[str, str]] = field(default_factory=list)
+    exact_string_fields: list[str] = field(default_factory=list)
+
+
 class Transport(Protocol):
     def insert(self, request: InsertRequest[TRecord]) -> TRecord: ...
     def query(self, request: QueryRequest) -> list[TRecord]: ...
+    def configure_collection(
+        self, request: ConfigureCollectionRequest
+    ) -> ConfigureCollectionResult: ...
 
 
 class NotImplementedTransport(Transport):
@@ -60,6 +79,13 @@ class NotImplementedTransport(Transport):
 
     def query(self, request: QueryRequest) -> list[TRecord]:
         raise RuntimeError("DNADB transport not configured: query is unavailable.")
+
+    def configure_collection(
+        self, request: ConfigureCollectionRequest
+    ) -> ConfigureCollectionResult:
+        raise RuntimeError(
+            "DNADB transport not configured: configure_collection is unavailable."
+        )
 
 
 class DNAdb:
@@ -91,6 +117,26 @@ class CollectionClient(Generic[TRecord]):
 
     def query(self) -> "QueryBuilder[TRecord]":
         return QueryBuilder(self._collection_name, self._transport)
+
+    def configure(
+        self,
+        *,
+        sort_indexes: list[str],
+        composite_sort_indexes: Optional[list[tuple[str, str]]] = None,
+        exact_string_fields: Optional[list[str]] = None,
+    ) -> ConfigureCollectionResult:
+        if not sort_indexes:
+            raise ValueError("sort_indexes must contain at least one field")
+        return self._transport.configure_collection(
+            ConfigureCollectionRequest(
+                collection=self._collection_name,
+                sort_indexes=list(sort_indexes),
+                composite_sort_indexes=list(composite_sort_indexes or []),
+                exact_string_fields=list(exact_string_fields)
+                if exact_string_fields is not None
+                else None,
+            )
+        )
 
 
 class QueryBuilder(Generic[TRecord]):
