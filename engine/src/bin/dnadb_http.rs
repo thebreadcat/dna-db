@@ -73,11 +73,15 @@ struct Args {
 struct AppState {
     rt: std::sync::Arc<Mutex<EngineRuntime>>,
     auth_required: bool,
+    admin_api_key: Option<String>,
     auth: std::sync::Arc<Mutex<IdentityStore>>,
     overlays: std::sync::Arc<OverlayRegistry>,
     metrics: std::sync::Arc<HttpMetrics>,
     request_slots: std::sync::Arc<Semaphore>,
+    max_connections: usize,
     slow_query_ms: u64,
+    started_at: Instant,
+    data_dir: PathBuf,
 }
 
 #[derive(Default)]
@@ -135,6 +139,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = EngineRuntime::open(args.data_dir.as_path(), args.mmap_bytes);
     let mut auth_store = IdentityStore::new();
     let mut overlays = OverlayRegistry::new();
+    let admin_api_key = args
+        .admin_api_key
+        .clone()
+        .or_else(|| std::env::var("DNADB_ADMIN_API_KEY").ok());
     overlays.define_overlay(OverlayDefinition::full("full"));
     overlays.define_overlay(OverlayDefinition {
         name: "redacted".to_string(),
@@ -160,10 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         extends: None,
         additionally_include: std::collections::HashMap::new(),
     });
-    if let Some(api_key) = args
-        .admin_api_key
-        .or_else(|| std::env::var("DNADB_ADMIN_API_KEY").ok())
-    {
+    if let Some(api_key) = admin_api_key.clone() {
         let _ = auth_store.create_identity(CreateIdentityRequest {
             name: "admin".to_string(),
             identity_type: IdentityType::Admin,
@@ -200,16 +205,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         rt: std::sync::Arc::new(Mutex::new(rt)),
         auth_required: args.auth_required || std::env::var("DNADB_AUTH_REQUIRED").ok().as_deref() == Some("1"),
+        admin_api_key,
         auth: std::sync::Arc::new(Mutex::new(auth_store)),
         overlays: std::sync::Arc::new(overlays),
         metrics: std::sync::Arc::new(HttpMetrics::default()),
         request_slots: std::sync::Arc::new(Semaphore::new(max_connections)),
+        max_connections,
         slow_query_ms,
+        started_at: Instant::now(),
+        data_dir: args.data_dir.clone(),
     };
+
+    let admin_api = Router::new()
+        .route("/status", get(admin_status))
+        .route("/collections", get(admin_collections))
+        .route(
+            "/collections/:collection",
+            get(admin_collection_summary),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin_key_middleware,
+        ))
+        .with_state(state.clone());
 
     let api = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        .nest("/admin", admin_api)
         .route(
             "/collections/:collection/sort-indexes",
             get(get_sort_indexes).post(configure_sort_indexes),
@@ -608,6 +631,133 @@ async fn query_find(
         }
         other => Err(ApiError::bad_request(format!("unexpected result: {other:?}"))),
     }
+}
+
+async fn admin_key_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(expected_key) = state.admin_api_key.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "error": "admin API disabled: set DNADB_ADMIN_API_KEY"
+            })),
+        )
+            .into_response();
+    };
+    let provided = req
+        .headers()
+        .get("x-admin-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if provided != expected_key {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "error": "unauthorized admin key" })),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+async fn admin_status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let mut rt = state.rt.lock().await;
+    let collections = rt.list_known_collections();
+    let mut total_records = 0u64;
+    for c in &collections {
+        total_records = total_records.saturating_add(
+            rt.collection_record_count(c).map_err(ApiError::runtime)?,
+        );
+    }
+    let inflight = state.metrics.inflight_requests.load(Ordering::Relaxed).saturating_sub(1);
+    let active_connections = inflight.min(state.max_connections as u64) as usize;
+    Ok(Json(json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_seconds": state.started_at.elapsed().as_secs(),
+        "data_dir": state.data_dir.display().to_string(),
+        "active_connections": active_connections,
+        "max_connections": state.max_connections,
+        "collections": collections,
+        "total_records": total_records
+    })))
+}
+
+async fn admin_collections(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let mut rt = state.rt.lock().await;
+    let collections = rt.list_known_collections();
+    let mut out = Vec::with_capacity(collections.len());
+    for name in collections {
+        let record_count = rt
+            .collection_record_count(&name)
+            .map_err(ApiError::runtime)?;
+        let wal_bytes = rt
+            .collection_wal_size_bytes(&name)
+            .map_err(ApiError::runtime)?;
+        let (sort_indexes, composites, exact_fields, state_name) = rt
+            .sort_index_status(&name)
+            .map_err(ApiError::runtime)?;
+        let composite_json: Vec<Value> = composites
+            .into_iter()
+            .map(|(a, b)| json!({ "fields": [a, b] }))
+            .collect();
+        out.push(json!({
+            "name": name,
+            "record_count": record_count,
+            "wal_bytes": wal_bytes,
+            "sort_indexes": sort_indexes,
+            "exact_string_fields": exact_fields,
+            "index_state": state_name,
+            "composite_sort_indexes": composite_json
+        }));
+    }
+    let count = out.len();
+    Ok(Json(json!({
+        "ok": true,
+        "collections": out,
+        "count": count
+    })))
+}
+
+async fn admin_collection_summary(
+    State(state): State<AppState>,
+    AxumPath(collection): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let mut rt = state.rt.lock().await;
+    let record_count = rt
+        .collection_record_count(&collection)
+        .map_err(ApiError::runtime)?;
+    let wal_bytes = rt
+        .collection_wal_size_bytes(&collection)
+        .map_err(ApiError::runtime)?;
+    let (fields, composites, exact_fields, state_name) = rt
+        .sort_index_status(&collection)
+        .map_err(ApiError::runtime)?;
+    let composites_json: Vec<Value> = composites
+        .into_iter()
+        .map(|(a, b)| json!({ "fields": [a, b] }))
+        .collect();
+    Ok(Json(json!({
+        "ok": true,
+        "collection": collection,
+        "record_count": record_count,
+        "wal_bytes": wal_bytes,
+        "indexes": {
+            "sort": {
+                "state": state_name,
+                "fields": fields,
+                "composite_fields": composites_json
+            },
+            "exact_string": {
+                "fields": exact_fields
+            }
+        }
+    })))
 }
 
 #[derive(serde::Deserialize)]

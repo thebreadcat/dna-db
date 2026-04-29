@@ -7,7 +7,8 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit"
+    "check": "tsc -p tsconfig.json --noEmit",
+    "integration": "npm run build && node scripts/integration.mjs"
   },
   "devDependencies": {
     "typescript": "^5.9.3"

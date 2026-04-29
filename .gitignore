@@ -54,6 +54,7 @@ build/
 /progress.md
 /BOTTLENECKS.md
 /ENHANCMENTS.md
+/BENCHMARKING_RUNBOOK.md
 
 # Ad-hoc benchmark corpora at repo root / under engine
 /bench-data-balanced/

@@ -579,6 +579,15 @@ impl DurableTransactionStore {
         self.tx_manager.record_version_count(record_id)
     }
 
+    pub fn record_count(&mut self) -> usize {
+        let tx = self.begin();
+        self.tx_manager.visible_records(&tx).len()
+    }
+
+    pub fn wal_size_bytes(&self) -> Result<u64, DurableTxnError> {
+        Ok(self.wal.file_size_bytes()?)
+    }
+
     fn replay_wal_to_mvcc(&mut self) -> Result<(), DurableTxnError> {
         let entries = self.wal.read_all_entries()?;
         for entry in entries {

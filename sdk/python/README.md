@@ -1,32 +1,36 @@
 # DNA-DB Python SDK
 
-Python baseline SDK for DNA-DB query/mutation flows.
+Install:
 
-## Current Surface
+```bash
+pip install dnadb-python-sdk
+```
 
-- `DNAdbClientConfig`: host/port/database/api key configuration
-- `DNAdb`: root client with `collection(name)` accessor
-- `CollectionClient`:
-  - `insert(record)`
-  - `where(field, op, value)` fluent entrypoint
-  - `query()` fluent entrypoint
-- `QueryBuilder`:
-  - `where(...)`, `include(...)`, `order_by(...)`, `limit(...)`
-  - `fetch()`, `fetch_one()`
-- `Transport` protocol for pluggable runtime transport
-- `NotImplementedTransport` guard transport by default
+The PyPI distribution is `dnadb-python-sdk`; the importable package is still `dnadb`.
 
-This stage provides API shape parity with the current TypeScript SDK. Network transport/wire binding remains a subsequent integration step.
-
-## Collection Configuration
-
-The SDK surface now supports collection-level sort index configuration through
-the pluggable transport:
+Quick start:
 
 ```python
-db.collection("products").configure(
-    sort_indexes=["price", "created_at", "rating"],
-    composite_sort_indexes=[("status", "updated_at")],
-    exact_string_fields=["sku", "title"],
+from dnadb import DNAdb, DNAdbClientConfig
+
+db = DNAdb(DNAdbClientConfig(host="127.0.0.1", port=8787, database="default"))
+posts = db.collection("posts")
+
+posts.insert({"id": 1, "title": "Hello", "status": "published"})
+rows = posts.where("status", "=", "published").limit(10).fetch()
+```
+
+Configure indexes:
+
+```python
+db.collection("posts").configure(
+    sort_indexes=["updated_at", "created_at"],
+    exact_string_fields=["slug", "status"],
 )
+```
+
+Integration test (requires running server):
+
+```bash
+DNADB_URL=http://127.0.0.1:8787 python -m unittest tests/test_integration.py
 ```

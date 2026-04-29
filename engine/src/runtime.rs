@@ -99,6 +99,16 @@ impl EngineRuntime {
         Ok(())
     }
 
+    pub fn collection_record_count(&mut self, collection: &str) -> Result<u64, RuntimeError> {
+        let store = self.ensure_store(collection)?;
+        Ok(store.record_count() as u64)
+    }
+
+    pub fn collection_wal_size_bytes(&mut self, collection: &str) -> Result<u64, RuntimeError> {
+        let store = self.ensure_store(collection)?;
+        Ok(store.wal_size_bytes()?)
+    }
+
     pub fn root_path(&self) -> &Path {
         &self.root
     }
